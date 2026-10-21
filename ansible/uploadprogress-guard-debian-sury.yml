@@ -16,12 +16,18 @@
     use_regex: false
   register: php_uploadprogress_guard_fpm_binaries
 
-## Only versions with a shipped .so (files/uploadprogress-guard/hp_uploadprogress_guard-X.Y.so = every minor Sury publishes, 5.6-8.5).
+## The .so files are built per PHP minor AND per CPU architecture: hp_uploadprogress_guard-X.Y-<arch>.so, where <arch>
+## is the `uname -m` name (x86_64, aarch64) and therefore equals ansible_architecture. Needs gathered facts.
+- name: set fact php_uploadprogress_guard_arch
+  ansible.builtin.set_fact:
+    php_uploadprogress_guard_arch: "{{ ansible_facts['architecture'] }}"
+
+## Only versions with a shipped .so (files/uploadprogress-guard/hp_uploadprogress_guard-X.Y-<arch>.so = every minor Sury publishes, 5.6-8.5).
 - name: set fact php_uploadprogress_guard_versions
   ansible.builtin.set_fact:
     php_uploadprogress_guard_versions: "{{ php_uploadprogress_guard_fpm_binaries.files | map(attribute='path') | map('basename') | map('regex_replace', '^php-fpm', '') | intersect(php_uploadprogress_guard_shipped_versions) | sort }}"
   vars:
-    php_uploadprogress_guard_shipped_versions: "{{ lookup('ansible.builtin.fileglob', 'uploadprogress-guard/*.so') | regex_findall('-([0-9]+\\.[0-9]+)\\.so') }}"
+    php_uploadprogress_guard_shipped_versions: "{{ lookup('ansible.builtin.fileglob', 'uploadprogress-guard/*-' ~ php_uploadprogress_guard_arch ~ '.so') | regex_findall('-([0-9]+\\.[0-9]+)-' ~ php_uploadprogress_guard_arch ~ '\\.so') }}"
 
 - name: Query extension_dir of php {{ php_uploadprogress_guard_versions | join(', ') }}
   ansible.builtin.command: "php{{ item }} -n -r 'echo PHP_EXTENSION_DIR;'"
@@ -30,9 +36,9 @@
   changed_when: false
 
 - block:
-    - name: hp_uploadprogress_guard-{{ item.item }}.so -> {{ item.stdout }}/hp_uploadprogress_guard.so
+    - name: hp_uploadprogress_guard-{{ item.item }}-{{ php_uploadprogress_guard_arch }}.so -> {{ item.stdout }}/hp_uploadprogress_guard.so
       ansible.builtin.copy:
-        src: "uploadprogress-guard/hp_uploadprogress_guard-{{ item.item }}.so"
+        src: "uploadprogress-guard/hp_uploadprogress_guard-{{ item.item }}-{{ php_uploadprogress_guard_arch }}.so"
         dest: "{{ item.stdout }}/hp_uploadprogress_guard.so"
         mode: '0644'
       loop: "{{ php_uploadprogress_guard_extension_dirs.results }}"

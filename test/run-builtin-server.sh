@@ -4,19 +4,22 @@
 # once without and once with the guard. Expected: without the guard the session file gets an
 # upload_progress_* entry; with the guard it stays empty while $_POST/$_FILES are unchanged.
 #
-#   ./test/run-builtin-server.sh 8.3
+#   ./test/run-builtin-server.sh 8.3          # Docker's native architecture
+#   ./test/run-builtin-server.sh 8.3 arm64    # or force one: amd64, arm64 (non-native runs under emulation)
 #
 set -u
 v="${1:-8.3}"
+platform=(${2:+--platform "linux/$2"})
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-docker run --rm -v "$HERE/dist:/dist:ro" -v "$HERE/test:/test:ro" "php:${v}-cli" bash -c '
+docker run --rm "${platform[@]}" -v "$HERE/dist:/dist:ro" -v "$HERE/test:/test:ro" "php:${v}-cli" bash -c '
   set -u
   apt-get -qq update >/dev/null 2>&1; apt-get -qq install -y curl >/dev/null 2>&1
   mkdir -p /tmp/sess; head -c 300000 /dev/urandom > /tmp/blob.bin
   v=$(php -r "echo PHP_MAJOR_VERSION.\".\".PHP_MINOR_VERSION;")
+  echo "===== php $v on $(uname -m)"
   for mode in without with; do
     args=(-n -d session.upload_progress.enabled=1 -d session.upload_progress.cleanup=0 -d session.use_strict_mode=0 -d session.save_path=/tmp/sess)
-    [ $mode = with ] && args+=(-d extension=/dist/hp_uploadprogress_guard-${v}.so)
+    [ $mode = with ] && args+=(-d extension=/dist/hp_uploadprogress_guard-${v}-$(uname -m).so)
     php "${args[@]}" -S 127.0.0.1:8099 -t /test >/tmp/srv.log 2>&1 &
     pid=$!; sleep 1
     echo "===== $mode guard: multipart upload WITH progress field + session cookie"

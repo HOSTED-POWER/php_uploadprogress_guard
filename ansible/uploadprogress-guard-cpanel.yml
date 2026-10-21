@@ -19,12 +19,18 @@
   loop: "{{ php_uploadprogress_guard_ea_roots.files | map(attribute='path') | map('basename') | map('regex_replace', '^ea-php([0-9])([0-9]+)$', '\\1.\\2') | sort }}"
   register: php_uploadprogress_guard_ea_binaries
 
-## Only versions with a shipped .so (files/uploadprogress-guard/hp_uploadprogress_guard-X.Y.so, 5.6-8.5).
+## The .so files are built per PHP minor AND per CPU architecture: hp_uploadprogress_guard-X.Y-<arch>.so, where <arch>
+## is the `uname -m` name (x86_64, aarch64) and therefore equals ansible_architecture. Needs gathered facts.
+- name: set fact php_uploadprogress_guard_arch
+  ansible.builtin.set_fact:
+    php_uploadprogress_guard_arch: "{{ ansible_facts['architecture'] }}"
+
+## Only versions with a shipped .so (files/uploadprogress-guard/hp_uploadprogress_guard-X.Y-<arch>.so, 5.6-8.5).
 - name: set fact php_uploadprogress_guard_versions
   ansible.builtin.set_fact:
     php_uploadprogress_guard_versions: "{{ php_uploadprogress_guard_ea_binaries.results | selectattr('stat.exists') | map(attribute='item') | intersect(php_uploadprogress_guard_shipped_versions) | sort }}"
   vars:
-    php_uploadprogress_guard_shipped_versions: "{{ lookup('ansible.builtin.fileglob', 'uploadprogress-guard/*.so') | regex_findall('-([0-9]+\\.[0-9]+)\\.so') }}"
+    php_uploadprogress_guard_shipped_versions: "{{ lookup('ansible.builtin.fileglob', 'uploadprogress-guard/*-' ~ php_uploadprogress_guard_arch ~ '.so') | regex_findall('-([0-9]+\\.[0-9]+)-' ~ php_uploadprogress_guard_arch ~ '\\.so') }}"
 
 - block:
     - name: Create directory -> /usr/local/hostedpower/php-modules (source for the ea-php hook)
@@ -33,18 +39,19 @@
         state: directory
         mode: '0755'
 
-    - name: Stage hp_uploadprogress_guard-X.Y.so + 20-hp_uploadprogress_guard.ini -> /usr/local/hostedpower/php-modules/
+    ## Only this host's architecture is staged, under the arch-less name hp_uploadprogress_guard-X.Y.so the hook expects.
+    - name: Stage hp_uploadprogress_guard-X.Y-{{ php_uploadprogress_guard_arch }}.so (as hp_uploadprogress_guard-X.Y.so) + 20-hp_uploadprogress_guard.ini -> /usr/local/hostedpower/php-modules/
       ansible.builtin.copy:
         src: "{{ item }}"
-        dest: "/usr/local/hostedpower/php-modules/{{ item | basename }}"
+        dest: "/usr/local/hostedpower/php-modules/{{ item | basename | regex_replace('-' ~ php_uploadprogress_guard_arch ~ '\\.so$', '.so') }}"
         mode: '0644'
-      loop: "{{ lookup('ansible.builtin.fileglob', 'uploadprogress-guard/*.so', wantlist=True) + ['20-hp_uploadprogress_guard.ini'] }}"
+      loop: "{{ lookup('ansible.builtin.fileglob', 'uploadprogress-guard/*-' ~ php_uploadprogress_guard_arch ~ '.so', wantlist=True) + ['20-hp_uploadprogress_guard.ini'] }}"
       loop_control:
         label: "{{ item | basename }}"
 
-    - name: hp_uploadprogress_guard-{{ item }}.so -> /opt/cpanel/ea-php{{ item | replace('.', '') }}/root/usr/lib64/php/modules/hp_uploadprogress_guard.so
+    - name: hp_uploadprogress_guard-{{ item }}-{{ php_uploadprogress_guard_arch }}.so -> /opt/cpanel/ea-php{{ item | replace('.', '') }}/root/usr/lib64/php/modules/hp_uploadprogress_guard.so
       ansible.builtin.copy:
-        src: "uploadprogress-guard/hp_uploadprogress_guard-{{ item }}.so"
+        src: "uploadprogress-guard/hp_uploadprogress_guard-{{ item }}-{{ php_uploadprogress_guard_arch }}.so"
         dest: "/opt/cpanel/ea-php{{ item | replace('.', '') }}/root/usr/lib64/php/modules/hp_uploadprogress_guard.so"
         mode: '0644'
       loop: "{{ php_uploadprogress_guard_versions }}"

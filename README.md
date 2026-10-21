@@ -8,7 +8,7 @@ release, and kept afterwards as a second layer and as the only fix for PHP versi
 receive updates.
 
 * One C source file, builds unchanged against PHP 5.6 through 8.5 (`src/`).
-* Prebuilt NTS x86_64 binaries per PHP minor with checksums (`dist/`).
+* Prebuilt NTS binaries per PHP minor for x86_64 and aarch64 (arm64), with checksums (`dist/`).
 * Ansible task files for Debian/Ubuntu (Sury packages), cPanel EA4 and DirectAdmin CustomBuild (`ansible/`).
 * Test tooling that proves the effect per SAPI (`test/`).
 
@@ -148,8 +148,8 @@ equal, and that is why the "stronger" claim is limited to the mechanism, not to 
 * **PHP versions:** 5.6, 7.0, 7.1, 7.2, 7.3, 7.4, 8.0, 8.1, 8.2, 8.3, 8.4, 8.5 (one source file, no
   per-version patches). 5.4/5.5 build the same way; no official Docker image exists to prebuild them.
 * **ABI:** a PHP extension's ABI is the Zend module API number of the minor version plus the NTS/ZTS
-  flavour (checked at load time). The prebuilt files are NTS x86_64 and load on any NTS build of that
-  minor: Sury, Remi, cPanel EA4, DirectAdmin CustomBuild, the official Docker images. ZTS builds need
+  flavour (checked at load time), and the binary must match the CPU architecture. The prebuilt files
+  are NTS, one per minor and architecture, and load on any NTS build of that minor: Sury, Remi, cPanel EA4, DirectAdmin CustomBuild, the official Docker images. ZTS builds need
   a rebuild from source.
 * **libc:** the binaries import no versioned glibc symbols at all (only `php_rfc1867_callback`, three
   `php_info_print_table_*` functions and loader glue, checked with `readelf --dyn-syms`), so a build
@@ -166,7 +166,8 @@ cd src && phpize && ./configure && make
 
 ### Prebuilt
 
-Pick `dist/hp_uploadprogress_guard-<X.Y>.so` for your minor version, verify it against
+Pick `dist/hp_uploadprogress_guard-<X.Y>-<arch>.so` for your minor version, where `<arch>` is what
+`uname -m` prints on the server (`x86_64` or `aarch64`), verify it against
 `dist/SHA256SUMS`, copy it to `php -n -r 'echo PHP_EXTENSION_DIR;'` as `hp_uploadprogress_guard.so`,
 and add an ini with `extension=hp_uploadprogress_guard.so` to the scan dir of every SAPI.
 
@@ -174,7 +175,7 @@ and add an ini with `extension=hp_uploadprogress_guard.so` to the scan dir of ev
 
 ```sh
 V=8.3
-install -m 0644 dist/hp_uploadprogress_guard-$V.so "$(php$V -n -r 'echo PHP_EXTENSION_DIR;')/hp_uploadprogress_guard.so"
+install -m 0644 dist/hp_uploadprogress_guard-$V-$(uname -m).so "$(php$V -n -r 'echo PHP_EXTENSION_DIR;')/hp_uploadprogress_guard.so"
 install -m 0644 ansible/mods-available-hp_uploadprogress_guard.ini /etc/php/$V/mods-available/hp_uploadprogress_guard.ini
 phpenmod -v $V -s ALL hp_uploadprogress_guard
 systemctl restart php$V-fpm        # and apache2 if you run mod_php
@@ -186,7 +187,7 @@ systemctl restart php$V-fpm        # and apache2 if you run mod_php
 for root in /opt/cpanel/ea-php*; do
     [ -x "$root/root/usr/bin/php" ] || continue
     v=$(basename "$root" | sed -E 's/^ea-php([0-9])([0-9]+)$/\1.\2/')
-    install -m 0644 "dist/hp_uploadprogress_guard-$v.so" "$root/root/usr/lib64/php/modules/hp_uploadprogress_guard.so"
+    install -m 0644 "dist/hp_uploadprogress_guard-$v-$(uname -m).so" "$root/root/usr/lib64/php/modules/hp_uploadprogress_guard.so"
     install -m 0644 ansible/20-hp_uploadprogress_guard.ini "$root/root/etc/php.d/20-hp_uploadprogress_guard.ini"
 done
 /scripts/restartsrv_apache_php_fpm   # cgi/lsapi SAPIs need no restart
@@ -197,7 +198,7 @@ done
 ```sh
 for bin in /usr/local/php[0-9]*/bin/php; do
     d=$(dirname "$(dirname "$bin")"); v=$(basename "$d" | sed -E 's/^php([0-9])([0-9]+)$/\1.\2/')
-    install -m 0644 "dist/hp_uploadprogress_guard-$v.so" "$("$bin" -n -r 'echo PHP_EXTENSION_DIR;')/hp_uploadprogress_guard.so"
+    install -m 0644 "dist/hp_uploadprogress_guard-$v-$(uname -m).so" "$("$bin" -n -r 'echo PHP_EXTENSION_DIR;')/hp_uploadprogress_guard.so"
     install -m 0644 ansible/20-hp_uploadprogress_guard.ini "$d/lib/php.conf.d/20-hp_uploadprogress_guard.ini"
     systemctl restart "php-fpm${v/./}"
 done
@@ -210,6 +211,10 @@ Re-run after a CustomBuild PHP rebuild, or hook it into `custombuild/custom/hook
 `ansible/` holds the task files we run in production (they expect the `.so` files under
 `files/uploadprogress-guard/` of a role and a `php_uploadprogress_guard_enabled` boolean for the
 opt-out/teardown path). They discover installed versions on the host, so nothing is hardcoded.
+Copy both architectures' `.so` files into the role: each host picks `hp_uploadprogress_guard-X.Y-<arch>.so`
+by `ansible_architecture`, so facts must be gathered. The cPanel and DirectAdmin tasks stage only the
+host's architecture in `/usr/local/hostedpower/php-modules`, under the arch-less name
+`hp_uploadprogress_guard-X.Y.so` that the ea-php / CustomBuild hooks read.
 
 ## Verify
 
@@ -295,8 +300,8 @@ map the library, conf.d/php.d/php.conf.d carry the ini.
 
 ```
 src/        hp_uploadprogress_guard.c, config.m4
-dist/       prebuilt NTS x86_64 .so per PHP minor + SHA256SUMS
-build.sh    rebuild dist/ from the official php:<X.Y>-cli images
+dist/       prebuilt NTS .so per PHP minor and arch (-x86_64, -aarch64) + SHA256SUMS
+build.sh    rebuild dist/ from the official php:<X.Y>-cli images (amd64 + arm64; ARCHS=... for one)
 test/       probe.php, run-builtin-server.sh (Docker functional test), fcgi-probe.py (php-fpm direct)
 ansible/    the task files and ini files we deploy (Debian/Sury, cPanel EA4, DirectAdmin)
 ```
