@@ -856,6 +856,13 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 		boundary_len = boundary_end-boundary;
 	}
 
+	/* Boundaries larger than FILLUNIT-strlen("\r\n--") characters lead to
+	 * erroneous parsing */
+	if (boundary_len > FILLUNIT-strlen("\r\n--")) {
+		sapi_module.sapi_error(E_WARNING, "Boundary too large in multipart/form-data POST data");
+		return;
+	}
+
 	/* Initialize the buffer */
 	if (!(mbuff = multipart_buffer_new(boundary, boundary_len))) {
 		sapi_module.sapi_error(E_WARNING, "Unable to initialize the input buffer");
@@ -1035,7 +1042,10 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 				skip_upload = 1;
 			} else if (upload_cnt <= 0) {
 				skip_upload = 1;
-				sapi_module.sapi_error(E_WARNING, "Maximum number of allowable file uploads has been exceeded");
+				if (upload_cnt == 0) {
+					--upload_cnt;
+					sapi_module.sapi_error(E_WARNING, "Maximum number of allowable file uploads has been exceeded");
+				}
 			}
 
 			/* Return with an error if the posted data is garbled */
