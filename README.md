@@ -536,15 +536,19 @@ the architecture from `ansible_facts['architecture']`.
 
 ### Windows
 
-`dist/windows/` holds a DLL per PHP minor (5.6, 7.2 to 8.5), thread safety and compiler, with `SHA256SUMS`:
-`php_hp_uploadprogress_guard-<X.Y>-<nts|ts>-<vc11|vc15|vs16|vs17>-<x64|x86>.dll`, 64-bit and 32-bit. The 7.2 to
+`dist/windows/` holds a DLL per PHP minor (5.4, 5.6, 7.2 to 8.5), thread safety and compiler, with `SHA256SUMS`:
+`php_hp_uploadprogress_guard-<X.Y>-<nts|ts>-<vc9|vc11|vc15|vs16|vs17>-<x64|x86>.dll`, 64-bit and 32-bit. The 7.2 to
 8.5 files are built by the `Windows build` workflow in this repository with the PHP team's
 [php-windows-builder](https://github.com/php/php-windows-builder); in the same run the x64 nts ones are loaded
 into a stock Windows PHP and every x86 one into the official windows.php.net x86 build of its branch
 (`--ri` output in the job log). The 5.6 files (VC11, x64 and x86, nts and ts) come
 from the `Windows build PHP 5.6 (VC11)` workflow: Visual Studio 2012 Express is installed on the runner from
 Microsoft's ISO, PHP 5.6.40 is built in-tree with the extension as a shared module, and every DLL is loaded
-into the official 5.6.40 VC11 zip from windows.php.net before it is published.
+into the official 5.6.40 VC11 zip from windows.php.net before it is published. The 5.4 files (VC9, x86, nts and
+ts; PHP 5.4 on Windows was only ever released as x86) come from the `Windows build PHP 5.4 (VC9)` workflow: the
+Visual C++ 2008 compiler and Windows SDK 6.0A are unpacked from Microsoft's Visual Studio 2008 Express ISO,
+PHP 5.4.45 is built in-tree, and every DLL is loaded into the official 5.4.45 VC9 x86 zip. A 5.4.45 build loads
+into every 5.4.x (same extension API).
 
 ```powershell
 php -i | findstr /C:"PHP Version" /C:"Thread Safety" /C:"Compiler" /C:"extension_dir"
@@ -557,7 +561,7 @@ php --ri hp_uploadprogress_guard
 
 The compiler tag must match your PHP build (`php -i` prints it): vc15 for 7.2 to 7.4, vs16 for 8.0 to 8.3, vs17
 for 8.4 and 8.5, which are also the builds windows.php.net ships. Thread safety must match too (IIS FastCGI uses
-nts, Apache mod_php uses ts); 5.6 is vc11, and `php -i` shows `Architecture => x86` or `x64`. PHP 7.0/7.1 on
+nts, Apache mod_php uses ts); 5.4 is vc9 (x86 only), 5.6 is vc11, and `php -i` shows `Architecture => x86` or `x64`. PHP 7.0/7.1 on
 Windows are not provided; those build from source with the PHP SDK: `phpize && configure --enable-hp-uploadprogress-guard && nmake` from
 the repository root (`config.w32` picks the parser copy; PHP 5.x has no phpize on Windows, build in-tree as the
 5.6 workflow does). PHP 5.x thread-safe builds compile since v3.2.2.
