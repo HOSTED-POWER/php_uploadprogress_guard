@@ -28,6 +28,9 @@
 #include <stdio.h>
 #include "php.h"
 #include "hp_glibc_compat.h"
+#if defined(PHP_WIN32) && defined(_MSC_VER) && _MSC_VER < 1600
+# include "win32/php_stdint.h"   /* VC9 (PHP 5.4 on Windows) has no <stdint.h>; this copy uses int64_t */
+#endif
 #include "php_open_temporary_file.h"
 #include "zend_globals.h"
 #include "php_globals.h"
