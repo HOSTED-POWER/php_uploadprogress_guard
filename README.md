@@ -1,8 +1,17 @@
 # hp_uploadprogress_guard
 
-**v3.2.4, 23 October 2026: two protections PHP itself does not ship yet.** Since the php2shell releases, two
-more problems have surfaced in current PHP. This module now covers both, on patched and unpatched PHP alike,
-so **keep it installed after you upgrade.**
+**v3.2.4, 23 October 2026: three issues PHP has not fixed in a release yet, covered.** Since the php2shell
+releases, three more problems have surfaced in current PHP. This module covers all three, on patched and
+unpatched PHP alike, so **keep it installed after you upgrade.**
+
+* **CVE-2026-115560, session upload progress (announced 23 October).** PHP's security team recommends
+  `session.upload_progress.enabled=0` until the next regular release
+  ([informational advisory](https://www.php.net/archive/2026.php#2026-10-23-1)); the 21 October releases do not
+  fix it. PHP rates it unlikely: it needs an application that changes `session.serialize_handler` at runtime,
+  with upload progress enabled. **Covered by the module by default**, on every PHP version, patched or not:
+  it detaches the upload-progress handler and forces `session.upload_progress.enabled` to `0`, locked so an
+  application, `.user.ini` or `ini_set()` cannot turn it back on. That is exactly PHP's mitigation, already in
+  place on every host running the module. Keep `hp_uploadprogress_guard.detach_upload_progress = 1` (the default).
 
 * **`unserialize()` use-after-free, in every current release.** When `unserialize()` cleans up, it frees its
   bookkeeping first and then runs object destructors; a destructor that calls `unserialize()` again works on
