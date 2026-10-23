@@ -56,7 +56,12 @@ jobs:
           if (-not ($cl -and $pdb -and $win -and $rc -and $mt -and $k32)) { throw "VC9 toolchain incomplete" }
           $vc = $cl.Directory.Parent.FullName
           $sdk = $win.Directory.Parent.FullName
-          "VC9_PATH=$($cl.DirectoryName);$($pdb.DirectoryName);$($rc.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # mc.exe (message compiler, for win32\build\wsyslog.mc) is not in the Express SDK subset; its output does not
+          # depend on the compiler, so the runner's current Windows SDK copy is appended at the END of the path
+          $mc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter mc.exe -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -eq 'x86' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $mc) { throw "mc.exe not found on the runner" }
+          Write-Host "found $($mc.FullName)"
+          "VC9_PATH=$($cl.DirectoryName);$($pdb.DirectoryName);$($rc.DirectoryName);$($mc.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "VC9_INCLUDE=$vc\include;$sdk\Include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "VC9_LIB=$vc\lib;$sdk\Lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           & $cl.FullName 2>&1 | Select-Object -First 1 | Out-String | Write-Host
