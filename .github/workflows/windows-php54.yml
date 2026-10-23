@@ -38,7 +38,9 @@ jobs:
             $p = Start-Process msiexec.exe -ArgumentList '/a', "`"$msi`"", '/qn', "TARGETDIR=`"$dir`"" -Wait -PassThru
             Write-Host "msiexec /a $(Split-Path $msi -Leaf) -> exit $($p.ExitCode)"
           }
-          Admin "$t\ix\vs_setup.msi" 'C:\vc9'
+          # vs_setup.msi refuses even an administrative install (1603); lessmsi reads its tables and writes the files
+          choco install lessmsi -y --no-progress | Out-Null
+          lessmsi x "$t\ix\vs_setup.msi" 'C:\vc9\' | Select-Object -Last 2 | Out-String | Write-Host
           Admin "$t\sdkb\winsdk_build.msi" 'C:\sdk6'
           Admin "$t\sdkb\VistaClientHeadersLibs-x86.msi" 'C:\sdk6'
           Admin "$t\sdkt\VistaClientExpressTools-x86.msi" 'C:\sdk6'
