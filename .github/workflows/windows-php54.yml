@@ -1,0 +1,94 @@
+name: Windows build PHP 5.4 (VC9)
+
+# PHP 5.4 on Windows is built with Visual C++ 9 (Visual Studio 2008), x86 only. This job installs Visual
+# Studio 2008 Express from Microsoft's ISO, builds PHP 5.4.45 in-tree with the extension as a shared module
+# and loads the DLL into the official 5.4.45 VC9 x86 zip from windows.php.net as the test (a 5.4.45 build
+# loads into every 5.4.x: same extension API). Manual trigger.
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/windows-php54.yml']
+
+jobs:
+  build:
+    name: PHP 5.4 ${{ matrix.ts }} x86
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        ts: [nts, ts]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ext
+
+      - name: Install Visual Studio 2008 Express (VC9)
+        shell: pwsh
+        run: |
+          $iso = "$env:RUNNER_TEMP\VS2008Express.iso"
+          curl.exe -sSL -o $iso https://download.microsoft.com/download/E/8/E/E8EEB394-7F42-4963-A2D8-29559B738298/VS2008ExpressWithSP1ENUX1504728.iso
+          Write-Host "ISO: $((Get-Item $iso).Length) bytes"
+          $drive = (Mount-DiskImage -ImagePath $iso -PassThru | Get-Volume).DriveLetter
+          Get-ChildItem "${drive}:\" | ForEach-Object { $_.Name }
+          Get-ChildItem "${drive}:\VCExpress" | ForEach-Object { $_.Name }
+          $p = Start-Process -FilePath "${drive}:\VCExpress\setup.exe" -ArgumentList '/q','/norestart' -Wait -PassThru
+          Write-Host "setup exit code $($p.ExitCode)"
+          $cl = "C:\Program Files (x86)\Microsoft Visual Studio 9.0\VC\bin\cl.exe"
+          if (-not (Test-Path $cl)) {
+            Write-Host "--- setup logs:"; Get-ChildItem $env:TEMP -Filter "*VS*2008*" -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }
+            Get-ChildItem $env:TEMP -Filter "dd_*.txt" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "== $($_.Name)"; Get-Content $_.FullName -Tail 25 }
+            Write-Host "--- VS 9.0:"; if (Test-Path "C:\Program Files (x86)\Microsoft Visual Studio 9.0") { Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio 9.0" -Recurse -Depth 2 -Directory | ForEach-Object { $_.FullName } }
+            throw "cl.exe not installed"
+          }
+          Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio 9.0\VC\bin" -Filter cl.exe | ForEach-Object { $_.FullName }
+          exit 0
+
+      - name: PHP SDK tools (legacy) and PHP 5.4.45 source
+        shell: pwsh
+        run: |
+          curl.exe -sSL -o sdk.zip https://github.com/php/php-sdk-binary-tools/archive/refs/heads/legacy.zip
+          Expand-Archive sdk.zip -DestinationPath sdk
+          curl.exe -sSL -o php-src.zip https://windows.php.net/downloads/releases/archives/php-5.4.45-src.zip
+          Expand-Archive php-src.zip -DestinationPath phpsrc
+          $src = Get-ChildItem phpsrc -Directory | Select-Object -First 1
+          Rename-Item $src.FullName php
+          Copy-Item -Recurse ext phpsrc\php\ext\hp_uploadprogress_guard
+
+      - name: Build PHP 5.4.45 with the extension as a shared module
+        shell: cmd
+        run: |
+          set PATH=%CD%\sdk\php-sdk-binary-tools-legacy\bin;%PATH%
+          call "C:\Program Files (x86)\Microsoft Visual Studio 9.0\VC\vcvarsall.bat" x86
+          cd phpsrc\php
+          call buildconf.bat
+          if "${{ matrix.ts }}"=="nts" (set ZTSFLAG=--disable-zts) else (set ZTSFLAG=)
+          call configure.bat --disable-all --enable-cli --enable-hp-uploadprogress-guard=shared %ZTSFLAG%
+          nmake
+          dir /s /b php_hp_uploadprogress_guard.dll php.exe
+
+      - name: Collect the DLL
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem phpsrc\php -Recurse -Filter php_hp_uploadprogress_guard.dll | Select-Object -First 1
+          if (-not $dll) { throw "DLL not built" }
+          New-Item -ItemType Directory out | Out-Null
+          Copy-Item $dll.FullName "out\php_hp_uploadprogress_guard-5.4-${{ matrix.ts }}-vc9-x86.dll"
+          Get-ChildItem out
+
+      - name: Load the DLL in the official PHP 5.4.45 VC9 x86 build
+        shell: pwsh
+        run: |
+          $nts = if ('${{ matrix.ts }}' -eq 'nts') { '-nts' } else { '' }
+          curl.exe -sSL -o php.zip "https://windows.php.net/downloads/releases/archives/php-5.4.45${nts}-Win32-VC9-x86.zip"
+          Expand-Archive php.zip -DestinationPath php54
+          $dll = (Get-ChildItem out\*.dll).FullName
+          & php54\php.exe -n -r "echo PHP_VERSION, ' ', PHP_ZTS ? 'ts' : 'nts', ' ', PHP_INT_SIZE * 8, 'bit', PHP_EOL;"
+          $out = & php54\php.exe -n -d "extension=$dll" --ri hp_uploadprogress_guard 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'version => 3\.' -or $out -match 'Unable to load|Warning') { throw "DLL did not load" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: php_hp_uploadprogress_guard-5.4-${{ matrix.ts }}-vc9-x86
+          path: out/*.dll
