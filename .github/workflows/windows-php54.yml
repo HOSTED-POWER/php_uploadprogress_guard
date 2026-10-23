@@ -23,25 +23,41 @@ jobs:
         with:
           path: ext
 
-      - name: Install Visual Studio 2008 Express (VC9)
+      - name: Unpack the VC9 compiler and Windows SDK 6.0A from the Visual Studio 2008 Express ISO
+        # VS2008's setup.exe does not run on current Windows; its MSI packages unpack with an administrative
+        # install (msiexec /a: files only, no installer logic). The compiler environment is then set by hand.
         shell: pwsh
         run: |
-          $iso = "$env:RUNNER_TEMP\VS2008Express.iso"
-          curl.exe -sSL -o $iso https://download.microsoft.com/download/E/8/E/E8EEB394-7F42-4963-A2D8-29559B738298/VS2008ExpressWithSP1ENUX1504728.iso
-          Write-Host "ISO: $((Get-Item $iso).Length) bytes"
-          $drive = (Mount-DiskImage -ImagePath $iso -PassThru | Get-Volume).DriveLetter
-          Get-ChildItem "${drive}:\" | ForEach-Object { $_.Name }
-          Get-ChildItem "${drive}:\VCExpress" | ForEach-Object { $_.Name }
-          $p = Start-Process -FilePath "${drive}:\VCExpress\setup.exe" -ArgumentList '/q','/norestart' -Wait -PassThru
-          Write-Host "setup exit code $($p.ExitCode)"
-          $cl = "C:\Program Files (x86)\Microsoft Visual Studio 9.0\VC\bin\cl.exe"
-          if (-not (Test-Path $cl)) {
-            Write-Host "--- setup logs:"; Get-ChildItem $env:TEMP -Filter "*VS*2008*" -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }
-            Get-ChildItem $env:TEMP -Filter "dd_*.txt" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "== $($_.Name)"; Get-Content $_.FullName -Tail 25 }
-            Write-Host "--- VS 9.0:"; if (Test-Path "C:\Program Files (x86)\Microsoft Visual Studio 9.0") { Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio 9.0" -Recurse -Depth 2 -Directory | ForEach-Object { $_.FullName } }
-            throw "cl.exe not installed"
+          $t = $env:RUNNER_TEMP
+          curl.exe -sSL -o "$t\vs2008.iso" https://download.microsoft.com/download/E/8/E/E8EEB394-7F42-4963-A2D8-29559B738298/VS2008ExpressWithSP1ENUX1504728.iso
+          7z x -y "-o$t\iso" "$t\vs2008.iso" VCExpress\Ixpvc.exe VCExpress\WCU\WinSDK VCExpress\WCU\vcredist_x86.exe | Out-Null
+          7z x -y "-o$t\ix" "$t\iso\VCExpress\Ixpvc.exe" | Out-Null
+          7z x -y "-o$t\sdkb" "$t\iso\VCExpress\WCU\WinSDK\WinSDK_Build.exe" | Out-Null
+          7z x -y "-o$t\sdkt" "$t\iso\VCExpress\WCU\WinSDK\WinSDK_Exp32Tools.exe" | Out-Null
+          function Admin($msi, $dir) {
+            $p = Start-Process msiexec.exe -ArgumentList '/a', "`"$msi`"", '/qn', "TARGETDIR=`"$dir`"" -Wait -PassThru
+            Write-Host "msiexec /a $(Split-Path $msi -Leaf) -> exit $($p.ExitCode)"
           }
-          Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio 9.0\VC\bin" -Filter cl.exe | ForEach-Object { $_.FullName }
+          Admin "$t\ix\vs_setup.msi" 'C:\vc9'
+          Admin "$t\sdkb\winsdk_build.msi" 'C:\sdk6'
+          Admin "$t\sdkb\VistaClientHeadersLibs-x86.msi" 'C:\sdk6'
+          Admin "$t\sdkt\VistaClientExpressTools-x86.msi" 'C:\sdk6'
+          $p = Start-Process "$t\iso\VCExpress\WCU\vcredist_x86.exe" -ArgumentList '/q' -Wait -PassThru
+          Write-Host "vcredist_x86 (VC9 runtime) -> exit $($p.ExitCode)"
+          $cl  = Get-ChildItem C:\vc9 -Recurse -Filter cl.exe -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -eq 'bin' } | Select-Object -First 1
+          $pdb = Get-ChildItem C:\vc9 -Recurse -Filter mspdb80.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          $win = Get-ChildItem C:\sdk6 -Recurse -Filter windows.h -ErrorAction SilentlyContinue | Select-Object -First 1
+          $rc  = Get-ChildItem C:\sdk6 -Recurse -Filter rc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          $mt  = Get-ChildItem C:\sdk6 -Recurse -Filter mt.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          $k32 = Get-ChildItem C:\sdk6 -Recurse -Filter kernel32.lib -ErrorAction SilentlyContinue | Select-Object -First 1
+          foreach ($x in @($cl, $pdb, $win, $rc, $mt, $k32)) { if ($x) { Write-Host "found $($x.FullName)" } }
+          if (-not ($cl -and $pdb -and $win -and $rc -and $mt -and $k32)) { throw "VC9 toolchain incomplete" }
+          $vc = $cl.Directory.Parent.FullName
+          $sdk = $win.Directory.Parent.FullName
+          "VC9_PATH=$($cl.DirectoryName);$($pdb.DirectoryName);$($rc.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VC9_INCLUDE=$vc\include;$sdk\Include" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VC9_LIB=$vc\lib;$sdk\Lib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & $cl.FullName 2>&1 | Select-Object -First 1 | Out-String | Write-Host
           exit 0
 
       - name: PHP SDK tools (legacy) and PHP 5.4.45 source
@@ -59,7 +75,10 @@ jobs:
         shell: cmd
         run: |
           set PATH=%CD%\sdk\php-sdk-binary-tools-legacy\bin;%PATH%
-          call "C:\Program Files (x86)\Microsoft Visual Studio 9.0\VC\vcvarsall.bat" x86
+          set PATH=%VC9_PATH%;%PATH%
+          set INCLUDE=%VC9_INCLUDE%
+          set LIB=%VC9_LIB%
+          cl 2>&1 | findstr /C:"Version"
           cd phpsrc\php
           call buildconf.bat
           if "${{ matrix.ts }}"=="nts" (set ZTSFLAG=--disable-zts) else (set ZTSFLAG=)
