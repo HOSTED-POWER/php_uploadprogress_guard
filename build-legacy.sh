@@ -16,7 +16,7 @@ for v in "$@"; do
   for arch in $ARCHS; do
     suffix=""; [ "$arch" = x86_64 ] || suffix="-$arch"
     d="$S/build-$v-$arch"; rm -rf "$d"; mkdir -p "$d/rfc1867"
-    cp "$S/config.m4" "$S/hp_uploadprogress_guard.c" "$S/hp_glibc_compat.h" "$d/"; cp "$S/rfc1867/rfc1867_copy-5.6.c" "$d/rfc1867/"
+    cp "$S/config.m4" "$S/hp_uploadprogress_guard.c" "$S/hp_uploadprogress_guard.h" "$S/hp_glibc_compat.h" "$d/"; cp "$S/rfc1867/rfc1867_copy-5.6.c" "$d/rfc1867/"
     echo "=== php-$(source_url "$v" | grep -o '5\.[45]\.[0-9]*') from source on php:5.6-cli-stretch ($arch)"
     docker run --rm --platform "$(platform "$arch")" -e URL="$(source_url "$v")" -e MAX_GLIBC="$MAX_GLIBC" -e SUFFIX="$suffix" -v "$d:/src:ro" -v "$OUT:/out" php:5.6-cli-stretch bash -c '
       [ "$(uname -m)" = "'"$arch"'" ] || { echo "image is $(uname -m), wanted '"$arch"'"; exit 1; }

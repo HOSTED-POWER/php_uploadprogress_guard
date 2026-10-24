@@ -4,6 +4,7 @@ config.h*
 configure*
 /hp_glibc_compat.h
 /hp_uploadprogress_guard.c
+/hp_uploadprogress_guard.h
 *.la
 .libs/
 *.lo

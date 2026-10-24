@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include "php.h"
 #include "hp_glibc_compat.h"
+#include "hp_uploadprogress_guard.h"
 #if defined(PHP_WIN32) && defined(_MSC_VER) && _MSC_VER < 1600
 # include "win32/php_stdint.h"   /* VC9 (PHP 5.4 on Windows) has no <stdint.h>; this copy uses int64_t */
 #endif
@@ -76,7 +77,6 @@ static int (*_hp_dead_cb)(unsigned int, void *, void ** TSRMLS_DC) = NULL;
 #define HP_MEM_CHUNK ((size_t) 2 * 1024 * 1024)
 #define HP_MEM_SLACK ((size_t) 4 * 1024 * 1024)
 #define HP_MAX_HDR_VALUE ((size_t) 64 * 1024)
-static int hp_stopped = 0;
 
 static int hp_mem_room(size_t need TSRMLS_DC)
 {
@@ -513,7 +513,7 @@ static int multipart_buffer_headers(multipart_buffer *self, zend_llist *header T
 				do { value++; } while(isspace((unsigned char)*value));
 				smart_str_appends(&buf_value, value);
 				if (buf_value.len > HP_MAX_HDR_VALUE) {
-					hp_stopped = 1;
+					HP_UPG_PARSER_G(hp_stopped) = 1;
 					if (key) {
 						efree(key);
 					}
@@ -524,7 +524,7 @@ static int multipart_buffer_headers(multipart_buffer *self, zend_llist *header T
 		} else if (buf_value.c) { /* If no ':' on the line, add to previous line */
 			smart_str_appends(&buf_value, line);
 			if (buf_value.len > HP_MAX_HDR_VALUE) {
-				hp_stopped = 1;
+				HP_UPG_PARSER_G(hp_stopped) = 1;
 				if (key) {
 					efree(key);
 				}
@@ -746,7 +746,7 @@ static char *multipart_buffer_read_body(multipart_buffer *self, unsigned int *le
 
 	while((read_bytes = multipart_buffer_read(self, buf, sizeof(buf), NULL TSRMLS_CC))) {
 		if (!hp_mem_room(2 * (total_bytes + read_bytes + 1) TSRMLS_CC)) {
-			hp_stopped = 1;
+			HP_UPG_PARSER_G(hp_stopped) = 1;
 			break;
 		}
 		out = erealloc(out, total_bytes + read_bytes + 1);
@@ -801,7 +801,7 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 		_basename = php_ap_basename;
 	}
 
-	hp_stopped = 0;
+	HP_UPG_PARSER_G(hp_stopped) = 0;
 	if (SG(post_max_size) > 0 && SG(request_info).content_length > SG(post_max_size)) {
 		sapi_module.sapi_error(E_WARNING, "POST Content-Length of %ld bytes exceeds the limit of %ld bytes", SG(request_info).content_length, SG(post_max_size));
 		return;
@@ -890,8 +890,8 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 
 		zend_llist_clean(&header);
 
-		if (hp_stopped || !hp_mem_room(0 TSRMLS_CC)) {
-			hp_stopped = 1;
+		if (HP_UPG_PARSER_G(hp_stopped) || !hp_mem_room(0 TSRMLS_CC)) {
+			HP_UPG_PARSER_G(hp_stopped) = 1;
 			goto fileupload_done;
 		}
 
@@ -957,6 +957,15 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 				unsigned int value_len;
 				char *value = multipart_buffer_read_body(mbuff, &value_len TSRMLS_CC);
 				unsigned int new_val_len; /* Dummy variable */
+
+				/* A stopped read returns a partial value. Never process that value. */
+				if (HP_UPG_PARSER_G(hp_stopped)) {
+					if (value) {
+						efree(value);
+					}
+					efree(param);
+					goto fileupload_done;
+				}
 
 				if (!value) {
 					value = estrdup("");
@@ -1412,7 +1421,7 @@ fileupload_done:
 	if (mbuff->buffer) efree(mbuff->buffer);
 	if (mbuff) efree(mbuff);
 
-	if (hp_stopped) {
+	if (HP_UPG_PARSER_G(hp_stopped)) {
 		hp_drop_request(array_ptr TSRMLS_CC);
 	}
 }
