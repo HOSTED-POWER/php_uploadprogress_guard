@@ -1,6 +1,6 @@
 # hp_uploadprogress_guard
 
-**v3.2.4, 23 October 2026: three issues PHP has not fixed in a release yet, covered.** Since the php2shell
+**v3.2.5, 24 October 2026: three issues PHP has not fixed in a release yet, covered.** Since the php2shell
 releases, three more problems have surfaced in current PHP. This module covers all three, on patched and
 unpatched PHP alike, so **keep it installed after you upgrade.**
 
@@ -184,6 +184,25 @@ module on unpatched engines.
   hp_uploadprogress_guard` shows `SimpleXML GC double-free workaround (php-src#24488) => active` on the
   affected releases and `not needed (this PHP release)` elsewhere.
 
+**v3.2.5** (24 October): parser fixes contributed by
+[NewEraCracker](https://github.com/NewEraCracker) (#25), thank you. **Thread-safe builds with threaded Apache
+should upgrade**; NTS builds (php-fpm, CGI, CLI, every prebuilt `.so`, the `nts` DLLs) were not affected by the
+first point.
+
+* The parser's stop flag ("memory headroom exhausted, stop this request") was one variable per process. On
+  thread-safe PHP under threaded Apache, a concurrent request could reset it, so a refused upload could continue
+  and its truncated value be processed. Measured on PHP 5.6 ZTS under Apache mpm_event: 1 of 40 refused
+  uploads went through with 3.2.4, 0 of 40 with 3.2.5. The flag is now per thread.
+* A field whose read was stopped is no longer processed at all (PHP 8.2's own fix, backported to the 5.4 to
+  8.1 parser copies).
+* Character classification gets an `unsigned char` in every parser copy, the oversized-boundary check of PHP 8.1
+  and Sury's backports is applied to 5.4 to 8.0 (a boundary over 5116 bytes is refused; browsers use at most
+  70), and "maximum number of file uploads exceeded" is logged once per request instead of once per extra file.
+
+Tested: build matrix 5.4 to 8.5 NTS plus thread-safe 5.6, 7.0, 7.4, 8.1 and 8.4 without warnings; identical
+`$_POST`/`$_FILES` to PHP's own parser on 16 builds (high-bit bytes, folded headers, quoted and 5116-byte
+boundaries, empty and too many files); the out-of-memory tests on 5.6, 7.4, 8.3 and 8.5.
+
 **v3.2.4** (23 October): status and documentation fixes reported in #17, #18 and #19, no change in what
 is protected. phpinfo's `mbstring.encoding_translation requests` row now follows the setting instead of
 only whether mbstring is loaded (#19). When an extension loaded before this one already cleared the session
@@ -287,8 +306,8 @@ On `memory_limit=-1` the headroom guard has nothing to guard and is inert; with 
 finite `memory_limit` is fine, so you do not need the advisories' `memory_limit=-1` workaround unless
 you want the belt-and-braces of `force_unlimited_memory`.
 
-Two implementation notes. The stop flag is one static per process, which is exact for NTS builds (all
-prebuilt files); a ZTS build from source could, in theory, see a spurious 413 on a concurrent thread.
+Two implementation notes. The stop flag is kept per thread (since v3.2.5), so on thread-safe builds
+concurrent requests cannot reset or inherit each other's decision.
 And php-fpm reads at most `CONTENT_LENGTH` bytes of body on its own, so the no-Content-Length strategy
 never reaches the parser through FPM; that one is mod_php's (Apache hands the parser a chunked body
 whole), and it is the strategy the advisory's confirmed exploit used.
