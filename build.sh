@@ -27,7 +27,7 @@ for v in "$@"; do
   for arch in $ARCHS; do
     suffix=""; [ "$arch" = x86_64 ] || suffix="-$arch"
     d="$S/build-$v-$arch"; rm -rf "$d"; mkdir -p "$d"
-    cp "$S/config.m4" "$S/hp_uploadprogress_guard.c" "$S/hp_glibc_compat.h" "$d/"
+    cp "$S/config.m4" "$S/hp_uploadprogress_guard.c" "$S/hp_uploadprogress_guard.h" "$S/hp_glibc_compat.h" "$d/"
     cp "$S/rfc1867/rfc1867_copy-$v.c" "$d/rfc1867_copy.c"
     img=$(image "$v")
     echo "=== $img ($arch)"

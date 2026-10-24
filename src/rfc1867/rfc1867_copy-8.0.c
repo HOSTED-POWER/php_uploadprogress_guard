@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include "php.h"
 #include "hp_glibc_compat.h"
+#include "hp_uploadprogress_guard.h"
 #include "php_open_temporary_file.h"
 /* flag added in 7.4.14 / 8.0.1; older patch releases take the same value as a plain open_basedir check */
 #ifndef PHP_TMP_FILE_OPEN_BASEDIR_CHECK_ON_FALLBACK
@@ -70,7 +71,6 @@ static int (*_hp_dead_cb)(unsigned int, void *, void **) = NULL;
 #define HP_MEM_CHUNK ((size_t) 2 * 1024 * 1024)
 #define HP_MEM_SLACK ((size_t) 4 * 1024 * 1024)
 #define HP_MAX_HDR_VALUE ((size_t) 64 * 1024)
-static int hp_stopped = 0;
 
 static int hp_mem_room(size_t need)
 {
@@ -477,7 +477,7 @@ static int multipart_buffer_headers(multipart_buffer *self, zend_llist *header)
 		}
 
 		/* space in the beginning means same header */
-		if (!isspace(line[0])) {
+		if (!isspace((unsigned char)line[0])) {
 			value = strchr(line, ':');
 		}
 
@@ -503,7 +503,7 @@ static int multipart_buffer_headers(multipart_buffer *self, zend_llist *header)
 				do { value++; } while (isspace((unsigned char)*value));
 				smart_string_appends(&buf_value, value);
 				if (buf_value.len > HP_MAX_HDR_VALUE) {
-					hp_stopped = 1;
+					HP_UPG_PARSER_G(hp_stopped) = 1;
 					if (key) {
 						efree(key);
 					}
@@ -514,7 +514,7 @@ static int multipart_buffer_headers(multipart_buffer *self, zend_llist *header)
 		} else if (buf_value.c) { /* If no ':' on the line, add to previous line */
 			smart_string_appends(&buf_value, line);
 			if (buf_value.len > HP_MAX_HDR_VALUE) {
-				hp_stopped = 1;
+				HP_UPG_PARSER_G(hp_stopped) = 1;
 				if (key) {
 					efree(key);
 				}
@@ -612,7 +612,7 @@ static char *substring_conf(char *start, size_t len, char quote)
 
 static char *php_ap_getword_conf(const zend_encoding *encoding, char *str)
 {
-	while (*str && isspace(*str)) {
+	while (*str && isspace((unsigned char)*str)) {
 		++str;
 	}
 
@@ -628,7 +628,7 @@ static char *php_ap_getword_conf(const zend_encoding *encoding, char *str)
 	} else {
 		char *strend = str;
 
-		while (*strend && !isspace(*strend)) {
+		while (*strend && !isspace((unsigned char)*strend)) {
 			++strend;
 		}
 		return substring_conf(str, (size_t)(strend - str), 0);
@@ -737,7 +737,7 @@ static char *multipart_buffer_read_body(multipart_buffer *self, size_t *len)
 
 	while((read_bytes = multipart_buffer_read(self, buf, sizeof(buf), NULL))) {
 		if (!hp_mem_room(2 * (total_bytes + read_bytes + 1))) {
-			hp_stopped = 1;
+			HP_UPG_PARSER_G(hp_stopped) = 1;
 			break;
 		}
 		out = erealloc(out, total_bytes + read_bytes + 1);
@@ -797,7 +797,7 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 		_basename = php_ap_basename;
 	}
 
-	hp_stopped = 0;
+	HP_UPG_PARSER_G(hp_stopped) = 0;
 	if (SG(post_max_size) > 0 && SG(request_info).content_length > SG(post_max_size)) {
 		sapi_module.sapi_error(E_WARNING, "POST Content-Length of " ZEND_LONG_FMT " bytes exceeds the limit of " ZEND_LONG_FMT " bytes", SG(request_info).content_length, SG(post_max_size));
 		return;
@@ -846,6 +846,13 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 		boundary_len = boundary_end-boundary;
 	}
 
+	/* Boundaries larger than FILLUNIT-strlen("\r\n--") characters lead to
+	 * erroneous parsing */
+	if (boundary_len > FILLUNIT-strlen("\r\n--")) {
+		sapi_module.sapi_error(E_WARNING, "Boundary too large in multipart/form-data POST data");
+		return;
+	}
+
 	/* Initialize the buffer */
 	if (!(mbuff = multipart_buffer_new(boundary, boundary_len))) {
 		sapi_module.sapi_error(E_WARNING, "Unable to initialize the input buffer");
@@ -884,8 +891,8 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 
 		zend_llist_clean(&header);
 
-		if (hp_stopped || !hp_mem_room(0)) {
-			hp_stopped = 1;
+		if (HP_UPG_PARSER_G(hp_stopped) || !hp_mem_room(0)) {
+			HP_UPG_PARSER_G(hp_stopped) = 1;
 			goto fileupload_done;
 		}
 
@@ -902,7 +909,7 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 				goto fileupload_done;
 			}
 
-			while (isspace(*cd)) {
+			while (isspace((unsigned char)*cd)) {
 				++cd;
 			}
 
@@ -910,7 +917,7 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 			{
 				char *key = NULL, *word = pair;
 
-				while (isspace(*cd)) {
+				while (isspace((unsigned char)*cd)) {
 					++cd;
 				}
 
@@ -956,6 +963,15 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 				size_t value_len;
 				char *value = multipart_buffer_read_body(mbuff, &value_len);
 				size_t new_val_len; /* Dummy variable */
+
+				/* A stopped read returns a partial value. Never process that value. */
+				if (HP_UPG_PARSER_G(hp_stopped)) {
+					if (value) {
+						efree(value);
+					}
+					efree(param);
+					goto fileupload_done;
+				}
 
 				if (!value) {
 					value = estrdup("");
@@ -1419,7 +1435,7 @@ fileupload_done:
 	if (mbuff->buffer) efree(mbuff->buffer);
 	if (mbuff) efree(mbuff);
 
-	if (hp_stopped) {
+	if (HP_UPG_PARSER_G(hp_stopped)) {
 		hp_drop_request(array_ptr);
 	}
 }

@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include "php.h"
 #include "hp_glibc_compat.h"
+#include "hp_uploadprogress_guard.h"
 #if defined(PHP_WIN32) && defined(_MSC_VER) && _MSC_VER < 1600
 # include "win32/php_stdint.h"   /* VC9 (PHP 5.4 on Windows) has no <stdint.h>; this copy uses int64_t */
 #endif
@@ -76,7 +77,6 @@ static int (*_hp_dead_cb)(unsigned int, void *, void ** TSRMLS_DC) = NULL;
 #define HP_MEM_CHUNK ((size_t) 2 * 1024 * 1024)
 #define HP_MEM_SLACK ((size_t) 4 * 1024 * 1024)
 #define HP_MAX_HDR_VALUE ((size_t) 64 * 1024)
-static int hp_stopped = 0;
 
 static int hp_mem_room(size_t need TSRMLS_DC)
 {
@@ -487,7 +487,7 @@ static int multipart_buffer_headers(multipart_buffer *self, zend_llist *header T
 		}
 
 		/* space in the beginning means same header */
-		if (!isspace(line[0])) {
+		if (!isspace((unsigned char)line[0])) {
 			value = strchr(line, ':');
 		}
 
@@ -513,7 +513,7 @@ static int multipart_buffer_headers(multipart_buffer *self, zend_llist *header T
 				do { value++; } while(isspace((unsigned char)*value));
 				smart_str_appends(&buf_value, value);
 				if (buf_value.len > HP_MAX_HDR_VALUE) {
-					hp_stopped = 1;
+					HP_UPG_PARSER_G(hp_stopped) = 1;
 					if (key) {
 						efree(key);
 					}
@@ -524,7 +524,7 @@ static int multipart_buffer_headers(multipart_buffer *self, zend_llist *header T
 		} else if (buf_value.c) { /* If no ':' on the line, add to previous line */
 			smart_str_appends(&buf_value, line);
 			if (buf_value.len > HP_MAX_HDR_VALUE) {
-				hp_stopped = 1;
+				HP_UPG_PARSER_G(hp_stopped) = 1;
 				if (key) {
 					efree(key);
 				}
@@ -601,11 +601,11 @@ static char *php_ap_getword(const zend_encoding *encoding, char **line, char sto
 	return res;
 }
 
-static char *substring_conf(char *start, int len, char quote)
+static char *substring_conf(char *start, size_t len, char quote)
 {
 	char *result = emalloc(len + 1);
 	char *resp = result;
-	int i;
+	size_t i;
 
 	for (i = 0; i < len && start[i] != quote; ++i) {
 		if (start[i] == '\\' && (start[i + 1] == '\\' || (quote && start[i + 1] == quote))) {
@@ -621,7 +621,7 @@ static char *substring_conf(char *start, int len, char quote)
 
 static char *php_ap_getword_conf(const zend_encoding *encoding, char *str TSRMLS_DC)
 {
-	while (*str && isspace(*str)) {
+	while (*str && isspace((unsigned char)*str)) {
 		++str;
 	}
 
@@ -637,10 +637,10 @@ static char *php_ap_getword_conf(const zend_encoding *encoding, char *str TSRMLS
 	} else {
 		char *strend = str;
 
-		while (*strend && !isspace(*strend)) {
+		while (*strend && !isspace((unsigned char)*strend)) {
 			++strend;
 		}
-		return substring_conf(str, strend - str, 0);
+		return substring_conf(str, (size_t)(strend - str), 0);
 	}
 }
 
@@ -693,9 +693,9 @@ static void *php_ap_memstr(char *haystack, int haystacklen, char *needle, int ne
 }
 
 /* read until a boundary condition */
-static int multipart_buffer_read(multipart_buffer *self, char *buf, int bytes, int *end TSRMLS_DC)
+static unsigned int multipart_buffer_read(multipart_buffer *self, char *buf, unsigned int bytes, int *end TSRMLS_DC)
 {
-	int len, max;
+	unsigned int len, max;
 	char *bound;
 
 	/* fill buffer if needed */
@@ -742,11 +742,11 @@ static int multipart_buffer_read(multipart_buffer *self, char *buf, int bytes, i
 static char *multipart_buffer_read_body(multipart_buffer *self, unsigned int *len TSRMLS_DC)
 {
 	char buf[FILLUNIT], *out=NULL;
-	int total_bytes=0, read_bytes=0;
+	unsigned int total_bytes=0, read_bytes=0;
 
 	while((read_bytes = multipart_buffer_read(self, buf, sizeof(buf), NULL TSRMLS_CC))) {
 		if (!hp_mem_room(2 * (total_bytes + read_bytes + 1) TSRMLS_CC)) {
-			hp_stopped = 1;
+			HP_UPG_PARSER_G(hp_stopped) = 1;
 			break;
 		}
 		out = erealloc(out, total_bytes + read_bytes + 1);
@@ -772,7 +772,8 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 {
 	char *boundary, *s = NULL, *boundary_end = NULL, *start_arr = NULL, *array_index = NULL;
 	char *temp_filename = NULL, *lbuf = NULL, *abuf = NULL;
-	int boundary_len = 0, cancel_upload = 0, is_arr_upload = 0, array_len = 0;
+	int boundary_len = 0, cancel_upload = 0, is_arr_upload = 0;
+	unsigned int array_len = 0;
 	int64_t total_bytes = 0, max_file_size = 0;
 	int skip_upload = 0, anonindex = 0, is_anonymous;
 	zval *http_post_files = NULL;
@@ -800,7 +801,7 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 		_basename = php_ap_basename;
 	}
 
-	hp_stopped = 0;
+	HP_UPG_PARSER_G(hp_stopped) = 0;
 	if (SG(post_max_size) > 0 && SG(request_info).content_length > SG(post_max_size)) {
 		sapi_module.sapi_error(E_WARNING, "POST Content-Length of %ld bytes exceeds the limit of %ld bytes", SG(request_info).content_length, SG(post_max_size));
 		return;
@@ -844,6 +845,13 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 		boundary_len = boundary_end-boundary;
 	}
 
+	/* Boundaries larger than FILLUNIT-strlen("\r\n--") characters lead to
+	 * erroneous parsing */
+	if (boundary_len > FILLUNIT-strlen("\r\n--")) {
+		sapi_module.sapi_error(E_WARNING, "Boundary too large in multipart/form-data POST data");
+		return;
+	}
+
 	/* Initialize the buffer */
 	if (!(mbuff = multipart_buffer_new(boundary, boundary_len TSRMLS_CC))) {
 		sapi_module.sapi_error(E_WARNING, "Unable to initialize the input buffer");
@@ -882,8 +890,8 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 
 		zend_llist_clean(&header);
 
-		if (hp_stopped || !hp_mem_room(0 TSRMLS_CC)) {
-			hp_stopped = 1;
+		if (HP_UPG_PARSER_G(hp_stopped) || !hp_mem_room(0 TSRMLS_CC)) {
+			HP_UPG_PARSER_G(hp_stopped) = 1;
 			goto fileupload_done;
 		}
 
@@ -895,7 +903,7 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 			char *pair = NULL;
 			int end = 0;
 
-			while (isspace(*cd)) {
+			while (isspace((unsigned char)*cd)) {
 				++cd;
 			}
 
@@ -903,7 +911,7 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 			{
 				char *key = NULL, *word = pair;
 
-				while (isspace(*cd)) {
+				while (isspace((unsigned char)*cd)) {
 					++cd;
 				}
 
@@ -949,6 +957,15 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 				unsigned int value_len;
 				char *value = multipart_buffer_read_body(mbuff, &value_len TSRMLS_CC);
 				unsigned int new_val_len; /* Dummy variable */
+
+				/* A stopped read returns a partial value. Never process that value. */
+				if (HP_UPG_PARSER_G(hp_stopped)) {
+					if (value) {
+						efree(value);
+					}
+					efree(param);
+					goto fileupload_done;
+				}
 
 				if (!value) {
 					value = estrdup("");
@@ -1018,7 +1035,10 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler) /* {{{ */
 				skip_upload = 1;
 			} else if (upload_cnt <= 0) {
 				skip_upload = 1;
-				sapi_module.sapi_error(E_WARNING, "Maximum number of allowable file uploads has been exceeded");
+				if (upload_cnt == 0) {
+					--upload_cnt;
+					sapi_module.sapi_error(E_WARNING, "Maximum number of allowable file uploads has been exceeded");
+				}
 			}
 
 			/* Return with an error if the posted data is garbled */
@@ -1401,7 +1421,7 @@ fileupload_done:
 	if (mbuff->buffer) efree(mbuff->buffer);
 	if (mbuff) efree(mbuff);
 
-	if (hp_stopped) {
+	if (HP_UPG_PARSER_G(hp_stopped)) {
 		hp_drop_request(array_ptr TSRMLS_CC);
 	}
 }

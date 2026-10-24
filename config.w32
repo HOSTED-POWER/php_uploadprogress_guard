@@ -16,6 +16,7 @@ if (PHP_HP_UPLOADPROGRESS_GUARD != "no") {
 		ERROR("no carried parser for PHP " + branch + " (src\\rfc1867\\rfc1867_copy-" + branch + ".c)");
 	}
 	FSO.CopyFile(src + "\\hp_uploadprogress_guard.c", here + "\\hp_uploadprogress_guard.c", true);
+	FSO.CopyFile(src + "\\hp_uploadprogress_guard.h", here + "\\hp_uploadprogress_guard.h", true);
 	FSO.CopyFile(src + "\\hp_glibc_compat.h", here + "\\hp_glibc_compat.h", true);
 	FSO.CopyFile(copy, here + "\\rfc1867_copy.c", true);
 	EXTENSION("hp_uploadprogress_guard", "hp_uploadprogress_guard.c rfc1867_copy.c", PHP_HP_UPLOADPROGRESS_GUARD_SHARED, "/DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");

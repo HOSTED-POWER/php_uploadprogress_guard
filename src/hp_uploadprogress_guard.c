@@ -60,6 +60,7 @@
 #endif
 #include "php.h"
 #include "hp_glibc_compat.h"
+#include "hp_uploadprogress_guard.h"
 #include "php_ini.h"
 #include "zend_ini.h"
 #include "ext/standard/info.h"
@@ -131,14 +132,6 @@ static SAPI_POST_HANDLER_FUNC(hp_upg_dispatch);
 static sapi_post_entry hp_upg_entry = { MULTIPART_CONTENT_TYPE, sizeof(MULTIPART_CONTENT_TYPE) - 1, NULL, hp_upg_dispatch };
 static int hp_upg_want_install = 0; /* decided once at MINIT: mode and whether PHP already carries the fix */
 
-/* The SAPI's table of POST handlers lives in per-thread SAPI globals: on a thread-safe build every new thread
- * starts from PHP's default entries (sapi_globals_ctor), so a handler registered at MINIT exists in the
- * startup thread only; Apache's request threads (mpm_winnt, worker, event) would keep PHP's own parser. The
- * entry is therefore installed per thread, from the module-globals constructor, which the engine runs in
- * every new thread before its first request. The status rows read the live table, never a flag. */
-ZEND_BEGIN_MODULE_GLOBALS(hp_uploadprogress_guard)
-	int entry_installed;
-ZEND_END_MODULE_GLOBALS(hp_uploadprogress_guard)
 ZEND_DECLARE_MODULE_GLOBALS(hp_uploadprogress_guard)
 #ifdef ZTS
 # if PHP_VERSION_ID >= 70000
@@ -184,6 +177,7 @@ static PHP_GINIT_FUNCTION(hp_uploadprogress_guard)
 	ZEND_TSRMLS_CACHE_UPDATE();
 #endif
 	hp_uploadprogress_guard_globals->entry_installed = 0;
+	hp_uploadprogress_guard_globals->hp_stopped = 0;
 	/* 0 in the startup thread (runs before MINIT, which installs there itself); 1 for every later thread */
 	if (hp_upg_want_install) {
 		hp_uploadprogress_guard_globals->entry_installed = hp_upg_install_entry(HP_UPG_TSRMLS_C);
