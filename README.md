@@ -1,13 +1,15 @@
 # hp_uploadprogress_guard
 
-**v3.2.5, 24 October 2026: three issues PHP has not fixed in a release yet, covered.** Since the php2shell
-releases, three more problems have surfaced in current PHP. This module covers all three, on patched and
-unpatched PHP alike, so **keep it installed after you upgrade.**
+**v3.2.6, 2 November 2026: three issues PHP has not fixed in a release yet, covered.** Since the php2shell
+releases, three more problems have surfaced in current PHP. PHP has since fixed two of them in its source code,
+but as of 2 November no PHP release contains any of the fixes: the latest are still 8.5.12, 8.4.27, 8.3.36 and
+8.2.35, from 21 October. This module covers all three, on patched and unpatched PHP alike, so **keep it
+installed after you upgrade.**
 
 * **CVE-2026-115560, session upload progress (announced 23 October).** PHP's security team recommends
   `session.upload_progress.enabled=0` until the next regular release
-  ([informational advisory](https://www.php.net/archive/2026.php#2026-10-23-1)); the 21 October releases do not
-  fix it. PHP rates it unlikely: it needs an application that changes `session.serialize_handler` at runtime,
+  ([informational advisory](https://www.php.net/archive/2026.php#2026-10-23-1)); no PHP release fixes it
+  yet. PHP rates it unlikely: it needs an application that changes `session.serialize_handler` at runtime,
   with upload progress enabled. **Covered by the module by default**, on every PHP version, patched or not:
   it detaches the upload-progress handler and forces `session.upload_progress.enabled` to `0`, locked so an
   application, `.user.ini` or `ini_set()` cannot turn it back on. That is exactly PHP's mitigation, already in
@@ -17,14 +19,18 @@ unpatched PHP alike, so **keep it installed after you upgrade.**
   bookkeeping first and then runs object destructors; a destructor that calls `unserialize()` again works on
   freed memory. This is the bug behind the "PHP 8.5.12 patch is incomplete" claims. Present in 8.5.12,
   8.4.27, 8.3.36, 8.2.35 and older; reachable when an application unserializes attacker-controlled data, or
-  by code already running on the host. Not fixed in any PHP release, no CVE (PHP does not assign CVEs to
-  `unserialize()` bugs): [php-src#24481](https://github.com/php/php-src/issues/24481).
+  by code already running on the host. No CVE (PHP does not assign CVEs to `unserialize()` bugs):
+  [php-src#24481](https://github.com/php/php-src/issues/24481), fixed in PHP's source on 30 October, not in a
+  release yet. PHP has since found more routes to the same bug (destructors run by the garbage collector,
+  error handlers, `__toString()`, `session_decode()`, fibers: [php-src#24674](https://github.com/php/php-src/issues/24674));
+  that fix is still under review and aimed at the next major version only.
   **Closed by the module since v3.2.0**: such nested calls get their own state. Verified with Valgrind on all
-  five releases named here: freed-memory reads without the module, none with it.
+  five releases named here: freed-memory reads without the module, none with it. PHP's own new tests for the
+  other routes give PHP's expected results with the module, with no memory errors (since v3.2.6, see below).
 * **SimpleXML crashes, introduced by 8.4.27 and 8.5.12.** The security release changed the garbage collector,
   and SimpleXML now frees its property table twice when an object converted with `json_encode()`, `(array)`
   or `get_object_vars()` (the everyday `json_decode(json_encode($xml), true)`) is collected in a reference
-  cycle: `zend_mm_heap corrupted`, a crashed worker. Fix approved by PHP, not released yet:
+  cycle: `zend_mm_heap corrupted`, a crashed worker. Fixed in PHP's source on 22 October, not released yet:
   [php-src#24488](https://github.com/php/php-src/issues/24488).
   **Fixed by the module since v3.2.1**, by applying PHP's approved fix from inside the module, only on those
   two releases. On a staging host with 8.4.27, a plain SimpleXML script crashed before and completed after.
@@ -147,7 +153,8 @@ module on unpatched engines.
   when it comes from an engine-invoked `Serializable::unserialize()` with no destructor or generator in
   between; every other nested call runs exactly like a top-level call, with its own state, and the outer
   state is restored afterwards (also when the inner call ends in a fatal error). That is the behaviour the
-  reporter proposes for PHP itself, applied from outside the engine, on every branch from 5.4 to 8.5.
+  reporter proposes for PHP itself, applied from outside the engine, on every branch from 5.4 to 8.5. On
+  PHP 8.1 and later the state is also kept per fiber (since v3.2.6), as PHP's pending fix does.
 * **What changes for applications.** Nothing on any normal path: top-level calls, `Serializable` nesting with
   shared back-references, `__wakeup()`/`__unserialize()` that unserialize, autoloaders, sessions, enums,
   fibers and generators behave exactly as before (identical output on all 14 branches, see the tests). Two
@@ -183,6 +190,26 @@ module on unpatched engines.
 * **Switch.** `hp_uploadprogress_guard.simplexml_gc_fix = 1` (default; `PHP_INI_SYSTEM`). `php --ri
   hp_uploadprogress_guard` shows `SimpleXML GC double-free workaround (php-src#24488) => active` on the
   affected releases and `not needed (this PHP release)` elsewhere.
+
+**v3.2.6** (2 November): the `unserialize()` protection now keeps its state per fiber. **Upgrade if your
+applications use fibers** (PHP 8.1 and later); nothing else changes.
+
+* PHP keeps one `unserialize()` state per thread, not one per fiber. When application code suspended a fiber in
+  the middle of an `unserialize()` (for example from `Serializable::unserialize()`) while another fiber also
+  unserialized, the module could restore a state that the other fiber had already freed: a use-after-free
+  that stock PHP does not have in that case. Found by running PHP's new tests for
+  [php-src#24674](https://github.com/php/php-src/issues/24674) against the module. The state is now saved
+  and restored per fiber, which is also what PHP's pending fix
+  ([php-src#24751](https://github.com/php/php-src/pull/24751)) does. As a side effect, one fiber no longer
+  sees another fiber's back-references, which stock PHP still allows.
+* PHP 5.4 to 8.0 have no fibers and are unchanged.
+
+Tested: Valgrind clean with the module on 8.1, 8.4 (NTS and ZTS) and 8.5 for the fiber case. The six tests
+from php-src#24751 report no memory errors, and the five memory-safety ones (garbage-collector destructor,
+error handler, `__toString()`, `session_decode()`, fibers) give PHP's expected output. The sixth concerns
+`allowed_classes` in a nested call from `__wakeup()`, which the module does not change; stock PHP behaves
+the same. PHP's own serialize, session, SPL and fiber test suites give the same results as with 3.2.5 on 8.1,
+8.4 NTS and ZTS, and 8.5.
 
 **v3.2.5** (24 October): parser fixes contributed by
 [NewEraCracker](https://github.com/NewEraCracker) (#25), thank you. **Thread-safe builds with threaded Apache

@@ -12,6 +12,9 @@
 ZEND_BEGIN_MODULE_GLOBALS(hp_uploadprogress_guard)
 	int entry_installed;
 	int hp_stopped;
+#if PHP_VERSION_ID >= 80100
+	HashTable *fiber_unser; /* unserialize() state of fibers suspended in the middle of one */
+#endif
 ZEND_END_MODULE_GLOBALS(hp_uploadprogress_guard)
 
 ZEND_EXTERN_MODULE_GLOBALS(hp_uploadprogress_guard)

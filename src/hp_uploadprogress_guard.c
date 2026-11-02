@@ -70,6 +70,9 @@
 #include "zend_extensions.h"
 #include "zend_interfaces.h"
 #include "ext/standard/basic_functions.h"
+#if PHP_VERSION_ID >= 80100
+#include "zend_observer.h"
+#endif
 #include <string.h>
 #include <stdarg.h>
 #ifdef PHP_WIN32
@@ -104,7 +107,7 @@ extern void hp_upg_sym_delayed_oom(void) __asm__("zend_handle_delayed_oom") __at
 extern void hp_upg_sym_safe_error_ex(void) __asm__("zend_mm_safe_error_ex") __attribute__((weak));
 #endif
 
-#define HP_MPG_VERSION "3.2.5"
+#define HP_MPG_VERSION "3.2.6"
 #define HP_MPG_NAME "hp_uploadprogress_guard"
 
 /* thread-safe (ZTS) builds, PHP 7+: per-thread globals cache (no-op on NTS) */
@@ -178,6 +181,9 @@ static PHP_GINIT_FUNCTION(hp_uploadprogress_guard)
 #endif
 	hp_uploadprogress_guard_globals->entry_installed = 0;
 	hp_uploadprogress_guard_globals->hp_stopped = 0;
+#if PHP_VERSION_ID >= 80100
+	hp_uploadprogress_guard_globals->fiber_unser = NULL;
+#endif
 	/* 0 in the startup thread (runs before MINIT, which installs there itself); 1 for every later thread */
 	if (hp_upg_want_install) {
 		hp_uploadprogress_guard_globals->entry_installed = hp_upg_install_entry(HP_UPG_TSRMLS_C);
@@ -371,6 +377,7 @@ static PHP_RINIT_FUNCTION(hp_uploadprogress_guard)
 	ZEND_TSRMLS_CACHE_UPDATE();
 #endif
 #if PHP_VERSION_ID >= 80100
+	HP_UPG_G(fiber_unser) = NULL; /* last request's table went with its memory */
 	if (!hp_upg_compile_hooked && !hp_upg_php_patched && zend_get_extension("Zend OPcache")) {
 		hp_upg_orig_compile_file = zend_compile_file;
 		zend_compile_file = hp_upg_compile_file;
@@ -727,6 +734,57 @@ static ZEND_NAMED_FUNCTION(hp_upg_session_decode)
 	hp_upg_orig_sdecode(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
+#if PHP_VERSION_ID >= 80100
+/* BG(unserialize) is one per thread, not one per fiber. A callback that suspends its fiber in the middle of an
+ * unserialization (Serializable::unserialize(), a destructor) leaves that context in place for whichever fiber
+ * runs next: that fiber shares it, and an isolated call above can put it back after the fiber that owns it has
+ * freed it (use-after-free). The state is therefore kept per fiber, as php-src#24751 does: saved when a fiber
+ * switches out, put back when it switches in, dropped when the fiber is destroyed. */
+typedef struct {
+	unsigned level;
+	void *data;
+} hp_upg_unser_state;
+
+static void hp_upg_unser_state_dtor(zval *zv)
+{
+	efree(Z_PTR_P(zv));
+}
+
+static void hp_upg_fiber_forget(zend_fiber_context *ctx)
+{
+	HashTable *ht = HP_UPG_G(fiber_unser);
+	if (ht && zend_hash_index_del(ht, (zend_ulong) (uintptr_t) ctx) == SUCCESS && !zend_hash_num_elements(ht)) {
+		zend_hash_destroy(ht);
+		FREE_HASHTABLE(ht);
+		HP_UPG_G(fiber_unser) = NULL;
+	}
+}
+
+static void hp_upg_fiber_switch(zend_fiber_context *from, zend_fiber_context *to)
+{
+	HashTable *ht = HP_UPG_G(fiber_unser);
+	hp_upg_unser_state *st;
+
+	if (BG(unserialize).level || BG(unserialize).data) {
+		if (!ht) {
+			ALLOC_HASHTABLE(ht);
+			zend_hash_init(ht, 8, NULL, hp_upg_unser_state_dtor, 0);
+			HP_UPG_G(fiber_unser) = ht;
+		}
+		st = emalloc(sizeof(*st));
+		st->level = BG(unserialize).level;
+		st->data = (void *) BG(unserialize).data;
+		zend_hash_index_update_ptr(ht, (zend_ulong) (uintptr_t) from, st);
+	}
+	st = ht ? zend_hash_index_find_ptr(ht, (zend_ulong) (uintptr_t) to) : NULL;
+	BG(unserialize).level = st ? st->level : 0;
+	BG(unserialize).data = st ? st->data : NULL;
+	if (st) {
+		hp_upg_fiber_forget(to);
+	}
+}
+#endif
+
 #if PHP_VERSION_ID < 70000
 static zend_function *hp_upg_find_function(const char *name, size_t len TSRMLS_DC)
 {
@@ -756,6 +814,10 @@ static void hp_upg_hook_unserialize(HP_UPG_TSRMLS_D)
 		hp_upg_orig_sdecode = f->internal_function.handler;
 		f->internal_function.handler = hp_upg_session_decode;
 	}
+#if PHP_VERSION_ID >= 80100
+	zend_observer_fiber_switch_register(hp_upg_fiber_switch);
+	zend_observer_fiber_destroy_register(hp_upg_fiber_forget);
+#endif
 	hp_upg_unser_hooked = 1;
 }
 
