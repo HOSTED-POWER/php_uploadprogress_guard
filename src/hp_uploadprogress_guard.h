@@ -19,6 +19,13 @@ ZEND_END_MODULE_GLOBALS(hp_uploadprogress_guard)
 
 ZEND_EXTERN_MODULE_GLOBALS(hp_uploadprogress_guard)
 
+/* Called by the parser when it drops a body: empties ext/filter's copy of the form fields as well. */
+#if PHP_VERSION_ID < 70000
+void hp_upg_filter_drop_post(TSRMLS_D);
+#else
+void hp_upg_filter_drop_post(void);
+#endif
+
 /*
  * Deliberately use the ordinary TSRMG accessor for the parser.
  * PHP 5 ZTS: the existing parser functions carry TSRMLS context.

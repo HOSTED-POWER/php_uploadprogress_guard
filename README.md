@@ -1,8 +1,8 @@
 # hp_uploadprogress_guard
 
-**v3.2.6, 2 November 2026: three issues PHP has not fixed in a release yet, covered.** Since the php2shell
+**v3.2.7, 12 November 2026: three issues PHP has not fixed in a release yet, covered.** Since the php2shell
 releases, three more problems have surfaced in current PHP. PHP has since fixed two of them in its source code,
-but as of 2 November no PHP release contains any of the fixes: the latest are still 8.5.12, 8.4.27, 8.3.36 and
+but as of 12 November no PHP release contains any of the fixes: the latest are still 8.5.12, 8.4.27, 8.3.36 and
 8.2.35, from 21 October. This module covers all three, on patched and unpatched PHP alike, so **keep it
 installed after you upgrade.**
 
@@ -52,6 +52,7 @@ and so does the detached session upload-progress handler (see point 4 below).
 **Install the official PHP release** (8.5.12, 8.4.27, 8.3.36, 8.2.35, and the PHP team's backports
 for 7.4, 8.0 and 8.1, which Sury extended down to 5.6); we recommend it without reservation. **This
 module protects an unpatched PHP for real.** It mirrors the official fix component by component,
+with one deliberate difference (memory running out while a script runs, see v3.1.0 below),
 tested per branch and per SAPI (see the tests below), so a host that runs it is protected today,
 whether its packages arrive tomorrow or never. After the upgrade its php2shell layers step aside on their
 own, so there is nothing to undo, and the v3.2.0 `unserialize()` protection keeps running. Read the advisories:
@@ -100,7 +101,11 @@ before. In detail:
   upload temp files it registered, instead of staying alive with half-cleaned state. That is what the
   official hard memory limit does, and what the PHP team chose for every memory exhaustion in the
   backports. php-fpm already discards a worker whose request startup failed; this matters for mod_php,
-  LiteSpeed, FrankenPHP and any other SAPI that keeps the process.
+  LiteSpeed, FrankenPHP and any other SAPI that keeps the process. **Not covered:** memory running out
+  while a script runs. The module leaves that to PHP's normal fatal error and bailout, after which the
+  request is shut down in full; the official fix also changes that case (8.2 and later handle it at a
+  safe point, the 7.4 to 8.1 backports end the process). The published attack routes run out of memory
+  before the script starts, which the parser guard and this exit cover.
 * **Request state cleared at request end.** The patch writes safe values over a set of pointers the
   engine leaves behind at shutdown (user error and exception handlers, recorded errors, the object
   store, the superglobals, the `request_info` strings, on 8.5 the saved fatal-error backtrace), so that
@@ -137,19 +142,21 @@ PHP 5.4 and 5.5 (#5).
 off; the PHP team reviewed that responsibly disclosed report and stated it is "an unrelated issue with no
 connection to the two vulnerabilities mitigated today" and "not urgent in any way". Neither touches the
 multipart parser, session state, OPcache or the memory-limit bailout: the two critical vulnerabilities,
-CVE-2026-109618 and CVE-2026-109619, are fixed in the released PHP versions and remain fully covered by this
-module on unpatched engines.
+CVE-2026-109618 and CVE-2026-109619, are fixed in the released PHP versions, and on unpatched engines this
+module closes their published attack routes (with the one difference noted under v3.1.0).
 
 **v3.2.0** (22 October): `unserialize()` re-entrancy isolation, details below.
 
-* **The bug.** While an `unserialize()` call is active, a nested `unserialize()` or `session_decode()` shares
+* **The bug.** While an `unserialize()` call is active, a nested `unserialize()` or `session_decode()` (since
+  v3.2.7 also `session_start()` and `session_reset()`, which decode the stored session) shares
   its state (`BG(unserialize)`); PHP needs that for exactly one thing, a `Serializable::unserialize()` method
   the engine calls during parsing, whose own `unserialize()` must resolve the outer back-references. At the
   end of the outer call `var_destroy()` frees the back-reference chunks and then drops the deferred values
   (objects replaced by duplicate keys, the return value of `__wakeup()`, the argument of `__unserialize()`)
   without holding `serialize_lock`. A destructor that runs at that moment and calls `unserialize()` reads and
   writes the freed chunks.
-* **The fix.** The module wraps `unserialize()` and `session_decode()`. A nested call keeps sharing state only
+* **The fix.** The module wraps `unserialize()` and `session_decode()` (and, since v3.2.7, `session_start()`
+  and `session_reset()`). A nested call keeps sharing state only
   when it comes from an engine-invoked `Serializable::unserialize()` with no destructor or generator in
   between; every other nested call runs exactly like a top-level call, with its own state, and the outer
   state is restored afterwards (also when the inner call ends in a fatal error). That is the behaviour the
@@ -164,13 +171,15 @@ module on unpatched engines.
   PHP, and is caught now.
 * **Cost.** No measurable difference on normal calls; about 50 ns extra per nested call inside the
   deprecated `Serializable::unserialize()`.
-* **Scope.** `unserialize()` and `session_decode()`. Extensions that unserialize with PHP's serializer
-  internally (APCu, Memcached or Redis with the `php` serializer) are not wrapped; reaching the bug through
+* **Scope.** `unserialize()`, `session_decode()`, `session_start()` and `session_reset()`. Extensions that
+  unserialize with PHP's serializer internally (APCu, Memcached or Redis with the `php` serializer) are not
+  wrapped, nor are the legacy `unserialize()` methods of SPL's classes (`ArrayObject`, `SplObjectStorage`,
+  ...), which PHP itself calls during parsing and which must share state there; reaching the bug through
   them needs attacker-controlled cache contents and such a destructor. On PHP 5.x the reproducers take a
   different path and do not reach the bug; the isolation is active there too.
 * **Switch.** `hp_uploadprogress_guard.unserialize_isolation = 1` (default; `PHP_INI_SYSTEM`). `php --ri
   hp_uploadprogress_guard` shows `unserialize() re-entrancy isolation ... => active (unserialize,
-  session_decode)`. Unlike the php2shell layers it does not step aside on patched PHP, because no PHP release
+  session_decode, session_start, session_reset)`. Unlike the php2shell layers it does not step aside on patched PHP, because no PHP release
   contains a fix.
 
 **v3.2.1** (22 October): SimpleXML garbage-collector double free on 8.4.27 and 8.5.12.
@@ -190,6 +199,26 @@ module on unpatched engines.
 * **Switch.** `hp_uploadprogress_guard.simplexml_gc_fix = 1` (default; `PHP_INI_SYSTEM`). `php --ri
   hp_uploadprogress_guard` shows `SimpleXML GC double-free workaround (php-src#24488) => active` on the
   affected releases and `not needed (this PHP release)` elsewhere.
+
+**v3.2.7** (12 November): two fixes from an external review, thank you.
+
+* **A dropped form no longer survives in `filter_input()`.** When the memory-headroom guard stops a request
+  (413), `$_POST` and `$_FILES` were emptied, but ext/filter keeps its own copy of every form field, so
+  `filter_input(INPUT_POST, ...)`, `filter_has_var()` and `filter_input_array()` still returned the fields
+  parsed before the stop. That copy is now emptied too. Only requests the guard stops are affected.
+* **`session_start()` and `session_reset()` get their own `unserialize()` state** when they run inside
+  another `unserialize()` (from a destructor, an error handler, `__toString()`), like `unserialize()` and
+  `session_decode()` since v3.2.0. Before, they decoded the stored session with the outer call's state:
+  they could see its back-references, the precondition for the use-after-free above.
+* The README now says plainly that memory running out *while a script runs* is left to PHP (see v3.1.0),
+  and that the headroom guard's margin can stop a request stock PHP would just have parsed (point 3 under
+  "What it does, silently").
+
+Tested on 8.3.35 and 5.6 (Apache, NTS) and 5.6 ZTS (Apache mpm_event): after a 413, `filter_input()`,
+`filter_has_var()` and `filter_input_array()` return nothing, GET data and normal forms are unchanged, and
+the concurrency test passes. Nested `session_start()` / `session_reset()` no longer see the outer state,
+while a normal `session_start()` and `Serializable` back-references behave as before. PHP's serialize,
+session, SPL and fiber suites give the same results as with 3.2.6 on 8.3 and 8.5.
 
 **v3.2.6** (2 November): the `unserialize()` protection now keeps its state per fiber. **Upgrade if your
 applications use fibers** (PHP 8.1 and later); nothing else changes.
@@ -292,11 +321,16 @@ Three things happen at process start. None of them is visible to an application:
    growth of a form-field value and every header line, and keeps an eighth of the limit (at least
    4 MB) plus one allocator chunk free for request startup and the script. If a step would not fit,
    parsing stops at that checkpoint with everything cleanly released, what was parsed is dropped,
-   `$_POST` and `$_FILES` are empty, the response code is 413 and one line goes to the error log. The
+   `$_POST`, `$_FILES` and ext/filter's copy (`filter_input()`, since v3.2.7) are empty, the response
+   code is 413, the script still runs, and one line goes to the error log. The
    engine is never asked for memory it does not have, so the `longjmp` of CVE-2026-109618 cannot start
-   inside the parser. A single part header is additionally capped at 64 KB. A request is only ever
-   stopped when, without the module, it would have ended in `Allowed memory size exhausted`; the default
-   `post_max_size=8M` against `memory_limit=128M` never comes near the line.
+   inside the parser. A single part header is additionally capped at 64 KB. The margin is deliberate:
+   a request that comes within an eighth of `memory_limit` is stopped even where stock PHP would just
+   have parsed it. A worker also keeps memory from earlier large requests, which PHP counts against
+   `memory_limit` (for its own limit check as much as for the guard), so how close a form comes to the
+   line depends on what the worker served before; in our tests stock PHP itself failed with `Allowed
+   memory size exhausted` on such a request. The default `post_max_size=8M` against `memory_limit=128M`
+   never comes near the line.
 4. **It steps aside on a patched PHP.** At startup the module reads `PHP_VERSION` (8.5.12, 8.4.27,
    8.3.36, 8.2.35 or later) and, since v3.1.0, looks for the symbols only a fixed engine exports, which
    also recognises vendor backports that keep their version number. On such an engine it leaves PHP's
@@ -309,7 +343,7 @@ Three things happen at process start. None of them is visible to an application:
    extension loaded earlier already cleared the handler: the ini is forced to `0` and locked as well, and
    phpinfo says so.
 5. **Nested `unserialize()` calls cannot reach freed memory** (since v3.2.0, on every engine, patched or
-   not). A nested `unserialize()` or `session_decode()` from a destructor, a generator or anything else
+   not). A nested `unserialize()`, `session_decode()`, `session_start()` or `session_reset()` from a destructor, a generator or anything else
    outside PHP's `Serializable` nesting runs with its own state, so it cannot work on the bookkeeping
    `var_destroy()` has already freed. See the v3.2.0 note above.
 6. **SimpleXML does not crash the garbage collector on 8.4.27 and 8.5.12** (since v3.2.1). See the v3.2.1
@@ -323,9 +357,9 @@ already enforces.
 ### Why you still install the official packages
 
 The one thing the module does not do is replace the engine. The patched release changes the memory allocator and OPcache from the inside;
-a module can mirror what those changes achieve, and since v3.1.0 it does so for every path the
-advisories and the fix describe, but it remains a layer around the engine rather than the engine
-itself. We recommend the official packages, and the module says so itself when it finds them. Until
+a module can mirror what those changes achieve, and since v3.1.0 it does so for the attack paths the
+advisories describe, but it remains a layer around the engine rather than the engine itself, and it
+leaves memory running out while a script runs to PHP (see v3.1.0). We recommend the official packages, and the module says so itself when it finds them. Until
 they are installed, and on installs where they never will be, this is protection you can rely on
 rather than a stopgap; afterwards it costs nothing to leave in place.
 

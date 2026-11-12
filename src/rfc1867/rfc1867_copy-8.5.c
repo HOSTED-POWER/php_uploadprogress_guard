@@ -92,6 +92,7 @@ static void hp_drop_request(zval *post_array)
 	if (Z_TYPE(PG(http_globals)[TRACK_VARS_FILES]) == IS_ARRAY) {
 		zend_hash_clean(Z_ARRVAL(PG(http_globals)[TRACK_VARS_FILES]));
 	}
+	hp_upg_filter_drop_post();
 	SG(sapi_headers).http_response_code = 413;
 	snprintf(msg, sizeof(msg), "hp_uploadprogress_guard: multipart body dropped, memory headroom exhausted "
 		"(memory_limit=%ld post_max_size=%ld read=%ld); request answered 413",

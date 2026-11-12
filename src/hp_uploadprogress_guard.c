@@ -107,7 +107,7 @@ extern void hp_upg_sym_delayed_oom(void) __asm__("zend_handle_delayed_oom") __at
 extern void hp_upg_sym_safe_error_ex(void) __asm__("zend_mm_safe_error_ex") __attribute__((weak));
 #endif
 
-#define HP_MPG_VERSION "3.2.6"
+#define HP_MPG_VERSION "3.2.7"
 #define HP_MPG_NAME "hp_uploadprogress_guard"
 
 /* thread-safe (ZTS) builds, PHP 7+: per-thread globals cache (no-op on NTS) */
@@ -590,8 +590,50 @@ static int hp_upg_native_needed(void)
 	return hp_upg_mbstring && INI_INT("mbstring.encoding_translation");
 }
 
+/* ext/filter keeps its own copy of every form field the parser registers (filter_input(INPUT_POST),
+ * filter_has_var(), filter_input_array()). When the parser drops a body, that copy is emptied too. ext/filter
+ * neither exports its globals nor lists them in its module entry, but its "filter.default" ini entry points at
+ * them (STD_PHP_INI_ENTRY: mh_arg2 = &filter_globals, or &filter_globals_id on thread-safe builds), and
+ * post_array is their first member in every PHP version. ext/filter not loaded: nothing to do. */
+void hp_upg_filter_drop_post(HP_UPG_TSRMLS_D)
+{
+	zend_ini_entry *ini;
+	void *g;
+#if PHP_VERSION_ID < 70000
+	zval **post;
+	if (zend_hash_find(EG(ini_directives), "filter.default", sizeof("filter.default"), (void **) &ini) != SUCCESS) {
+		return;
+	}
+#else
+	zval *post;
+	ini = zend_hash_str_find_ptr(EG(ini_directives), "filter.default", sizeof("filter.default") - 1);
+	if (!ini) {
+		return;
+	}
+#endif
+	if (!ini->mh_arg2) {
+		return;
+	}
+#ifdef ZTS
+	g = ts_resource(*(ts_rsrc_id *) ini->mh_arg2);
+#else
+	g = ini->mh_arg2;
+#endif
+	post = g;
+#if PHP_VERSION_ID < 70000
+	if (*post && Z_TYPE_PP(post) == IS_ARRAY) {
+		zend_hash_clean(Z_ARRVAL_PP(post));
+	}
+#else
+	if (Z_TYPE_P(post) == IS_ARRAY) {
+		zend_hash_clean(Z_ARRVAL_P(post));
+	}
+#endif
+}
+
 /* ---- unserialize() re-entrancy isolation ----
- * unserialize() and session_decode() share the context of an outer unserialization when one is active
+ * unserialize(), session_decode(), and session_start() / session_reset() (which decode the stored session)
+ * share the context of an outer unserialization when one is active
  * (BG(unserialize).level > 0 and serialize_lock 0). PHP relies on that for one thing only: a
  * Serializable::unserialize() method the engine calls while parsing, whose own unserialize() must see the
  * outer back-references. var_destroy() frees the back-reference chunks first and then drops the dtor-list
@@ -614,6 +656,10 @@ static zend_function *hp_upg_unser_fn = NULL;
 static zend_function *hp_upg_sdecode_fn = NULL;
 static hp_upg_handler_t hp_upg_orig_unser = NULL;
 static hp_upg_handler_t hp_upg_orig_sdecode = NULL;
+static zend_function *hp_upg_sstart_fn = NULL;
+static zend_function *hp_upg_sreset_fn = NULL;
+static hp_upg_handler_t hp_upg_orig_sstart = NULL;
+static hp_upg_handler_t hp_upg_orig_sreset = NULL;
 static int hp_upg_unser_hooked = 0;
 
 static int hp_upg_name_is(const char *n, size_t len, const char *lit, size_t litlen)
@@ -623,7 +669,7 @@ static int hp_upg_name_is(const char *n, size_t len, const char *lit, size_t lit
 
 static int hp_upg_is_origin(zend_function *f)
 {
-	return f && ((hp_upg_unser_fn && f == hp_upg_unser_fn) || (hp_upg_sdecode_fn && f == hp_upg_sdecode_fn));
+	return f && (f == hp_upg_unser_fn || f == hp_upg_sdecode_fn || f == hp_upg_sstart_fn || f == hp_upg_sreset_fn);
 }
 
 #if PHP_VERSION_ID >= 70000
@@ -734,6 +780,24 @@ static ZEND_NAMED_FUNCTION(hp_upg_session_decode)
 	hp_upg_orig_sdecode(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
+static ZEND_NAMED_FUNCTION(hp_upg_session_start)
+{
+	if (HP_UPG_NEEDS_ISOLATION()) {
+		hp_upg_run_isolated(hp_upg_orig_sstart, INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	hp_upg_orig_sstart(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
+static ZEND_NAMED_FUNCTION(hp_upg_session_reset)
+{
+	if (HP_UPG_NEEDS_ISOLATION()) {
+		hp_upg_run_isolated(hp_upg_orig_sreset, INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	hp_upg_orig_sreset(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
 #if PHP_VERSION_ID >= 80100
 /* BG(unserialize) is one per thread, not one per fiber. A callback that suspends its fiber in the middle of an
  * unserialization (Serializable::unserialize(), a destructor) leaves that context in place for whichever fiber
@@ -814,6 +878,18 @@ static void hp_upg_hook_unserialize(HP_UPG_TSRMLS_D)
 		hp_upg_orig_sdecode = f->internal_function.handler;
 		f->internal_function.handler = hp_upg_session_decode;
 	}
+	f = HP_UPG_FIND("session_start");
+	if (f && f->type == ZEND_INTERNAL_FUNCTION) {
+		hp_upg_sstart_fn = f;
+		hp_upg_orig_sstart = f->internal_function.handler;
+		f->internal_function.handler = hp_upg_session_start;
+	}
+	f = HP_UPG_FIND("session_reset");
+	if (f && f->type == ZEND_INTERNAL_FUNCTION) {
+		hp_upg_sreset_fn = f;
+		hp_upg_orig_sreset = f->internal_function.handler;
+		f->internal_function.handler = hp_upg_session_reset;
+	}
 #if PHP_VERSION_ID >= 80100
 	zend_observer_fiber_switch_register(hp_upg_fiber_switch);
 	zend_observer_fiber_destroy_register(hp_upg_fiber_forget);
@@ -829,7 +905,13 @@ static void hp_upg_unhook_unserialize(void)
 	if (hp_upg_sdecode_fn && hp_upg_sdecode_fn->internal_function.handler == hp_upg_session_decode) {
 		hp_upg_sdecode_fn->internal_function.handler = hp_upg_orig_sdecode;
 	}
-	hp_upg_unser_fn = hp_upg_sdecode_fn = NULL;
+	if (hp_upg_sstart_fn && hp_upg_sstart_fn->internal_function.handler == hp_upg_session_start) {
+		hp_upg_sstart_fn->internal_function.handler = hp_upg_orig_sstart;
+	}
+	if (hp_upg_sreset_fn && hp_upg_sreset_fn->internal_function.handler == hp_upg_session_reset) {
+		hp_upg_sreset_fn->internal_function.handler = hp_upg_orig_sreset;
+	}
+	hp_upg_unser_fn = hp_upg_sdecode_fn = hp_upg_sstart_fn = hp_upg_sreset_fn = NULL;
 	hp_upg_unser_hooked = 0;
 }
 
@@ -1115,7 +1197,7 @@ static PHP_MINFO_FUNCTION(hp_uploadprogress_guard)
 		: (hp_upg_sxe_wanted ? "pending (installed on first request)"
 		: (hp_upg_sxe_affected() ? (INI_BOOL("hp_uploadprogress_guard.simplexml_gc_fix") ? "n/a (SimpleXML not loaded)" : "off") : "not needed (this PHP release)")));
 #endif
-	php_info_print_table_row(2, "unserialize() re-entrancy isolation (destructors during var_destroy)", hp_upg_unser_hooked ? (hp_upg_sdecode_fn ? "active (unserialize, session_decode)" : "active (unserialize)") : "off");
+	php_info_print_table_row(2, "unserialize() re-entrancy isolation (destructors during var_destroy)", hp_upg_unser_hooked ? (hp_upg_sdecode_fn ? "active (unserialize, session_decode, session_start, session_reset)" : "active (unserialize)") : "off");
 	php_info_print_table_end();
 	DISPLAY_INI_ENTRIES();
 }
