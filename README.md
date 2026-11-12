@@ -200,7 +200,7 @@ module closes their published attack routes (with the one difference noted under
   hp_uploadprogress_guard` shows `SimpleXML GC double-free workaround (php-src#24488) => active` on the
   affected releases and `not needed (this PHP release)` elsewhere.
 
-**v3.2.7** (12 November): three fixes from an external review, thank you.
+**v3.2.7** (12 November): three fixes from a review by Vincent Schmalbach, thank you.
 
 * **No more 413 for a small form on a busy worker** (PHP 8.1 and later). The allocator keeps memory from
   earlier requests cached and counts it in the usage figure the headroom guard reads. After a few requests
