@@ -88,6 +88,15 @@ static int hp_mem_room(size_t need)
 	reserve = limit / 8 < HP_MEM_SLACK ? HP_MEM_SLACK : limit / 8;
 	used = zend_memory_usage(1);
 	need = (need + HP_MEM_CHUNK - 1) & ~(HP_MEM_CHUNK - 1);
+	if (used + need + HP_MEM_SLACK + reserve > limit && limit > need + HP_MEM_SLACK + reserve) {
+		/* That figure includes the chunks the allocator keeps cached from earlier requests on this worker, which
+		 * the next allocations reuse without growing it. A limit below the current usage makes engines that
+		 * support it free those cached chunks; the limit is put back right away (nothing allocates in between),
+		 * and on engines that do not, the two calls change nothing. */
+		zend_set_memory_limit(limit - need - HP_MEM_SLACK - reserve);
+		zend_set_memory_limit(limit);
+		used = zend_memory_usage(1);
+	}
 	return used + need + HP_MEM_SLACK + reserve <= limit;
 }
 

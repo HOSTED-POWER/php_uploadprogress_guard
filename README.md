@@ -200,7 +200,14 @@ module closes their published attack routes (with the one difference noted under
   hp_uploadprogress_guard` shows `SimpleXML GC double-free workaround (php-src#24488) => active` on the
   affected releases and `not needed (this PHP release)` elsewhere.
 
-**v3.2.7** (12 November): two fixes from an external review, thank you.
+**v3.2.7** (12 November): three fixes from an external review, thank you.
+
+* **No more 413 for a small form on a busy worker** (PHP 8.1 and later). The allocator keeps memory from
+  earlier requests cached and counts it in the usage figure the headroom guard reads. After a few requests
+  that used most of `memory_limit`, the guard refused even a tiny form (413), which stock PHP served from
+  that cache. The guard now has PHP release the cached memory before it decides, through PHP's own
+  `zend_set_memory_limit()` (asked for a lower limit, it frees cached chunks; the limit is restored at once).
+  On 7.x and 8.0, whose allocator cannot release the cache this way, nothing changes.
 
 * **A dropped form no longer survives in `filter_input()`.** When the memory-headroom guard stops a request
   (413), `$_POST` and `$_FILES` were emptied, but ext/filter keeps its own copy of every form field, so
@@ -214,7 +221,9 @@ module closes their published attack routes (with the one difference noted under
   and that the headroom guard's margin can stop a request stock PHP would just have parsed (point 3 under
   "What it does, silently").
 
-Tested on 8.3.35 and 5.6 (Apache, NTS) and 5.6 ZTS (Apache mpm_event): after a 413, `filter_input()`,
+Tested on 8.3.35 (Apache, `memory_limit=128M`): after four requests of about 120 MB, a tiny form got 413
+with 3.2.6 and gets 200 now, a 40 MB body is still refused, and `memory_limit` stays exactly 128M (also on
+7.4 and 8.0, right after a refusal). On 8.3.35 and 5.6 (Apache, NTS) and 5.6 ZTS (Apache mpm_event): after a 413, `filter_input()`,
 `filter_has_var()` and `filter_input_array()` return nothing, GET data and normal forms are unchanged, and
 the concurrency test passes. Nested `session_start()` / `session_reset()` no longer see the outer state,
 while a normal `session_start()` and `Serializable` back-references behave as before. PHP's serialize,
@@ -326,11 +335,11 @@ Three things happen at process start. None of them is visible to an application:
    engine is never asked for memory it does not have, so the `longjmp` of CVE-2026-109618 cannot start
    inside the parser. A single part header is additionally capped at 64 KB. The margin is deliberate:
    a request that comes within an eighth of `memory_limit` is stopped even where stock PHP would just
-   have parsed it. A worker also keeps memory from earlier large requests, which PHP counts against
-   `memory_limit` (for its own limit check as much as for the guard), so how close a form comes to the
-   line depends on what the worker served before; in our tests stock PHP itself failed with `Allowed
-   memory size exhausted` on such a request. The default `post_max_size=8M` against `memory_limit=128M`
-   never comes near the line.
+   have parsed it. A worker also keeps memory cached from earlier large requests, which PHP counts
+   against `memory_limit`; since v3.2.7 the guard has PHP release that cache before it decides (PHP 8.1
+   and later; 7.x and 8.0 cannot release it), so a small form is no longer refused because of what the
+   worker served before. The default `post_max_size=8M` against `memory_limit=128M` never comes near the
+   line.
 4. **It steps aside on a patched PHP.** At startup the module reads `PHP_VERSION` (8.5.12, 8.4.27,
    8.3.36, 8.2.35 or later) and, since v3.1.0, looks for the symbols only a fixed engine exports, which
    also recognises vendor backports that keep their version number. On such an engine it leaves PHP's
