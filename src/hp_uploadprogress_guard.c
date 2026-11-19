@@ -54,6 +54,11 @@
  *   arguments into the fatal-error backtrace. The fix is inside the engine; this module applies the
  *   advisory's workaround instead: fatal_error_backtraces forced to 0 and locked (PHP_INI_SYSTEM), unless
  *   hp_uploadprogress_guard.disable_fatal_backtraces=0.
+ * CVE-2026-129289 (5.6+): the unread request body is drained in the wrapper around the SAPI's deactivate
+ *   callback when PHP skipped that because php://input was opened (FastCGI request smuggling on kept
+ *   connections).
+ * CVE-2026-129496 (all): the same wrapper clears ext/date's timezone cache pointer at the end of startup and of
+ *   every request, before the memory it points into is released.
  *
  * Engines carrying the official fix export a symbol the old ones lack: zend_handle_delayed_oom() (8.2+,
  * delayed out-of-memory handled at a safe point) or zend_mm_safe_error_ex() (the 7.4/8.0/8.1 "minimal
@@ -81,6 +86,7 @@
 #include "zend_extensions.h"
 #include "zend_interfaces.h"
 #include "ext/standard/basic_functions.h"
+#include "ext/date/php_date.h"
 #if PHP_VERSION_ID >= 80100
 #include "zend_observer.h"
 #endif
@@ -329,13 +335,60 @@ static int hp_upg_sapi_wrapped = 0;
 #define HP_UPG_CLEAR_ZV(zv) ZVAL_UNDEF(&(zv))
 #endif
 
+/* CVE-2026-129496: an error logged to a file while no request is active caches the timezone in memory that is
+ * released right after (end of startup, end of a request after ext/date dropped its cache); the next request's
+ * first diagnostic used the stale cache. The SAPI's deactivate callback runs at both points, just before that
+ * memory goes: the pointer is cleared there (without freeing, the memory is released next). Globals from the
+ * module entry, as for ext/session. */
+static void hp_upg_date_clear_tzcache(HP_UPG_TSRMLS_D)
+{
+	zend_date_globals *g;
+#if PHP_VERSION_ID < 70000
+	zend_module_entry *m = NULL;
+	if (zend_hash_find(&module_registry, "date", sizeof("date"), (void **) &m) != SUCCESS) {
+		m = NULL;
+	}
+#else
+	zend_module_entry *m = zend_hash_str_find_ptr(&module_registry, "date", sizeof("date") - 1);
+#endif
+	if (!m || !m->module_started) {
+		return;
+	}
+#ifdef ZTS
+	g = ts_resource(*m->globals_id_ptr);
+#else
+	g = m->globals_ptr;
+#endif
+	g->tzcache = NULL;
+}
+
 /* sapi_deactivate_module() frees the request_info strings and then calls the SAPI's deactivate callback
- * (same order on 5.6 - 8.5): clear the freed pointers here, as the fix does right after each efree(). */
+ * (same order on 5.6 - 8.5): clear the freed pointers here, as the fix does right after each efree().
+ * Installed on every engine; the request_info part only where the php2shell fix is missing. */
 static int hp_upg_sapi_deactivate(HP_UPG_TSRMLS_D)
 {
 	int r = SUCCESS;
+#if PHP_VERSION_ID >= 50600
+	/* CVE-2026-129289: sapi_deactivate_module() skips draining the unread request body when php://input was
+	 * opened; on a kept FastCGI connection the rest of the body is then read as the next request. Drain it
+	 * here, before the SAPI finishes the request, as the fix does. */
+	if (SG(server_context) && !SG(post_read)) {
+		char buf[SAPI_POST_BLOCK_SIZE];
+#if PHP_VERSION_ID < 70000
+		while ((size_t) sapi_read_post_block(buf, sizeof(buf) TSRMLS_CC) == sizeof(buf)) {
+		}
+#else
+		while (sapi_read_post_block(buf, sizeof(buf)) == sizeof(buf)) {
+		}
+#endif
+	}
+#endif
+	hp_upg_date_clear_tzcache(HP_UPG_TSRMLS_C);
 	if (hp_upg_orig_sapi_deactivate) {
 		r = hp_upg_orig_sapi_deactivate(HP_UPG_TSRMLS_C);
+	}
+	if (hp_upg_php_patched) {
+		return r;
 	}
 	SG(request_info).auth_user = NULL;
 	SG(request_info).auth_password = NULL;
@@ -1170,10 +1223,10 @@ static PHP_MINIT_FUNCTION(hp_uploadprogress_guard)
 #endif
 	if (!hp_upg_php_patched) {
 		hp_upg_install_oom_hook();
-		hp_upg_orig_sapi_deactivate = sapi_module.deactivate;
-		sapi_module.deactivate = hp_upg_sapi_deactivate;
-		hp_upg_sapi_wrapped = 1;
 	}
+	hp_upg_orig_sapi_deactivate = sapi_module.deactivate;
+	sapi_module.deactivate = hp_upg_sapi_deactivate;
+	hp_upg_sapi_wrapped = 1;
 	if (INI_BOOL("hp_uploadprogress_guard.force_unlimited_memory")) {
 		hp_upg_force_memory_unlimited();
 	}
@@ -1255,6 +1308,8 @@ static PHP_MINFO_FUNCTION(hp_uploadprogress_guard)
 		: (hp_upg_sxe_wanted ? "pending (installed on first request)"
 		: (hp_upg_sxe_affected() ? (INI_BOOL("hp_uploadprogress_guard.simplexml_gc_fix") ? "n/a (SimpleXML not loaded)" : "off") : "not needed (this PHP release)")));
 #endif
+	php_info_print_table_row(2, "unread request body drained before the SAPI finishes (CVE-2026-129289)", PHP_VERSION_ID >= 50600 && hp_upg_sapi_wrapped ? "active" : "n/a");
+	php_info_print_table_row(2, "timezone cache cleared before startup and request memory is released (CVE-2026-129496)", hp_upg_sapi_wrapped ? "active" : "inactive");
 #if PHP_VERSION_ID >= 80300
 	php_info_print_table_row(2, "session start location cleared at request end (CVE-2026-129481)", HP_UPG_MODULE_LOADED("session") ? "active" : "n/a (session not loaded)");
 #endif

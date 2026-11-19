@@ -1,10 +1,24 @@
 # hp_uploadprogress_guard
 
-**v3.3.0, 19 November 2026: three of today's critical PHP advisories closed by the module.** PHP released
-8.5.13, 8.4.28, 8.3.37 and 8.2.36 today. Three of the advisories published with them are use-after-free bugs
-the module can close from outside the engine, so v3.3.0 does, on every PHP of the affected branches, patched
-for php2shell or not:
+**v3.3.0, 19 November 2026: five of today's critical PHP advisories closed by the module.** PHP released
+8.5.13, 8.4.28, 8.3.37 and 8.2.36 today, with 17 advisories, six of them critical. Five of those six can be
+closed from outside the engine, so v3.3.0 does, on every PHP of the affected branches (including the
+end-of-life ones the module supports), patched for php2shell or not. The sixth, CVE-2026-115560, is covered by
+the module since its first version.
 
+* **CVE-2026-129289, FastCGI request smuggling (5.6 to 8.5; critical, no memory corruption needed).** When an
+  application opens `php://input` without reading it to the end, PHP skips draining the rest of the request
+  body. On a kept FastCGI connection (nginx `fastcgi_keep_conn on`, Apache `enablereuse=on`) PHP-FPM then
+  reads the rest of the body as a new request: an attacker's forged request with its own `SCRIPT_FILENAME`,
+  `REMOTE_ADDR` and `PHP_ADMIN_VALUE`, enough to run their own PHP code.
+  [GHSA-qc49-hpvq-g2w6](https://github.com/php/php-src/security/advisories/GHSA-qc49-hpvq-g2w6).
+  **Closed:** the module drains the unread body before the SAPI finishes the request, as the fix does.
+* **CVE-2026-129496, timezone cache use-after-free (all versions; critical).** A warning written to a PHP
+  error log file during startup (an invalid `date.timezone`, a deprecated setting) leaves ext/date's timezone
+  cache pointing into freed startup memory, and the first warning of a worker's first request (too many input
+  variables) uses it. [GHSA-gr4f-wgx5-jpfv](https://github.com/php/php-src/security/advisories/GHSA-gr4f-wgx5-jpfv).
+  **Closed:** the module clears that pointer at the end of startup and of every request, before the memory it
+  points into is released.
 * **CVE-2026-129481, interrupted session shutdown (8.3, 8.4, 8.5; critical).** A fatal error in a callback
   that runs while the session shuts down (a user stream wrapper's `stream_close()`, for example) leaves
   ext/session pointing at a script filename in freed memory, and a later request on the same worker frees it
@@ -25,10 +39,13 @@ for php2shell or not:
   reported, without the stack trace 8.5 added to them. `hp_uploadprogress_guard.disable_fatal_backtraces = 0`
   keeps them.
 
-The other four advisories of the release sit where a module cannot reach: the PHP-FPM master process
-(CVE-2026-129291, only with `catch_workers_output = yes`), the HTTP and FTP stream wrappers (CVE-2026-128064,
-mixed-case `HTTPS://`; CVE-2026-127960, folded response headers) and the 8.5 URI extension (CVE-2026-129438).
-Each advisory lists its workaround.
+Not covered, because a module cannot reach the code or the fix needs PHP's own internals; each advisory lists
+its workaround: CVE-2026-126714 (`files` session handler, interrupted writes; critical, needs an application
+gadget chain), CVE-2026-129291 (PHP-FPM master, only with `catch_workers_output = yes`), CVE-2026-128064
+(mixed-case `HTTPS://` / `FTPS://` in the stream wrappers), CVE-2026-127960 (folded HTTP response headers),
+CVE-2026-128090 (PHAR signatures), CVE-2026-129506 and CVE-2026-15353 (SOAP), CVE-2026-129501 (DOM),
+CVE-2026-129538 (PHP-CGI `PATH_INFO`), CVE-2026-129292 (PHP-FPM status page) and CVE-2026-129438 (8.5 URI
+extension).
 
 Today's releases also fix two of the three issues below: the SimpleXML crash (the module's workaround now
 applies to 8.4.27 and 8.5.12 only) and CVE-2026-115560 (session upload progress is now off by default). The
@@ -234,7 +251,17 @@ module closes their published attack routes (with the one difference noted under
   hp_uploadprogress_guard` shows `SimpleXML GC double-free workaround (php-src#24488) => active` on the
   affected releases and `not needed (this PHP release)` elsewhere, including 8.4.28 and 8.5.13 (since v3.3.0).
 
-**v3.3.0** (19 November): three advisories of PHP's 19 November security release, see the top of this page.
+**v3.3.0** (19 November): five advisories of PHP's 19 November security release, see the top of this page.
+
+* **CVE-2026-129289** (5.6 and later): the wrapper around the SAPI's deactivate callback, so far installed only
+  on engines without the php2shell fix, is now installed on every engine. When PHP did not read the whole
+  request body, it drains the rest there (`sapi_read_post_block()`), before the SAPI finishes the request:
+  PHP skips that when `php://input` was opened. phpinfo: `unread request body drained before the SAPI
+  finishes (CVE-2026-129289) => active`.
+* **CVE-2026-129496** (all versions): the same wrapper clears ext/date's timezone cache pointer. It runs at the
+  end of startup, after the last startup warning and right before startup memory is released, and at the end
+  of every request, after ext/date dropped its cache. phpinfo: `timezone cache cleared before startup and
+  request memory is released (CVE-2026-129496) => active`.
 
 * **CVE-2026-129481** (8.3 and later): the post-deactivate function, which runs after every extension's request
   shutdown and before the request's memory is released, clears ext/session's recorded start location
@@ -250,8 +277,13 @@ module closes their published attack routes (with the one difference noted under
   `hp_uploadprogress_guard.disable_fatal_backtraces = 1` (default; `PHP_INI_SYSTEM`).
 * The SimpleXML workaround (v3.2.1) now applies to 8.4.27 and 8.5.12 only: 8.4.28 and 8.5.13 carry the fix.
 
-Tested with PHP's own reproducers for these advisories, in the official PHP-FPM images, reading the worker's
-memory after the triggering request. 8.5.12 and 8.4.26: after an interrupted session shutdown the worker kept a
+Tested in the official PHP-FPM images. 8.5.12, 8.4.26 and 7.4.33, one kept FastCGI connection, a POST body
+larger than `post_max_size` that the script reads only partly through `php://input`, with a forged FastCGI
+request after the part it read: without the module the forged request ran (with its own `REMOTE_ADDR`), with it
+the body is drained and nothing else runs. 8.5.12 and 8.4.26 with an invalid `date.timezone` and a PHP error
+log file: a fresh worker started with the timezone cache pointing into freed startup memory without the module,
+and was `NULL` with it. With PHP's own reproducers for the other three, reading the worker's
+memory after the triggering request: 8.5.12 and 8.4.26: after an interrupted session shutdown the worker kept a
 dangling `session_started_filename` without the module, and holds `NULL` with it. 8.5.12: after the
 `max_memory_limit` restore failure the saved backtrace survived the request without the module, and is cleared
 with it. 8.5.12 CLI, `__callStatic()` with an out-of-memory error: the backtrace showed wrong arguments read
@@ -417,9 +449,10 @@ Three things happen at process start. None of them is visible to an application:
    `var_destroy()` has already freed. See the v3.2.0 note above.
 6. **SimpleXML does not crash the garbage collector on 8.4.27 and 8.5.12** (since v3.2.1). See the v3.2.1
    note above.
-7. **Request state from the 19 November advisories is cleared at request end** (since v3.3.0): ext/session's
-   recorded start location (8.3+) and the saved fatal-error backtrace (8.5); on 8.5 before 8.5.13
-   `fatal_error_backtraces` is forced to `0` and locked. See the v3.3.0 note above.
+7. **Request state from the 19 November advisories is cleared at request end** (since v3.3.0): the unread
+   request body is drained (5.6+), ext/date's timezone cache pointer is cleared (also at the end of startup),
+   and so are ext/session's recorded start location (8.3+) and the saved fatal-error backtrace (8.5); on 8.5
+   before 8.5.13 `fatal_error_backtraces` is forced to `0` and locked. See the v3.3.0 note above.
 
 Since v3.0.2 the module also writes the master value of `session.upload_progress.enabled` to `0` and locks
 the entry at `PHP_INI_SYSTEM`: `ini_get()` returns `"0"`, `phpinfo()` shows `Off => Off`, and `.user.ini`,
