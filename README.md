@@ -1,10 +1,10 @@
 # hp_uploadprogress_guard
 
 **v3.3.0, 19 November 2026: five of today's critical PHP advisories closed by the module.** PHP released
-8.5.13, 8.4.28, 8.3.37 and 8.2.36 today, with 17 advisories, six of them critical. Five of those six can be
-closed from outside the engine, so v3.3.0 does, on every PHP of the affected branches (including the
-end-of-life ones the module supports), patched for php2shell or not. The sixth, CVE-2026-115560, is covered by
-the module since its first version.
+8.5.13, 8.4.28, 8.3.37 and 8.2.36 today, with 17 advisories, seven of them critical. Five of those seven can
+be closed from outside the engine, so v3.3.0 does, on every PHP of the affected branches (including the
+end-of-life ones the module supports), patched for php2shell or not. A sixth, CVE-2026-115560, is covered by
+the module since its first version; the seventh, CVE-2026-126714, is not (see below).
 
 * **CVE-2026-129289, FastCGI request smuggling (5.6 to 8.5; critical, no memory corruption needed).** When an
   application opens `php://input` without reading it to the end, PHP skips draining the rest of the request
