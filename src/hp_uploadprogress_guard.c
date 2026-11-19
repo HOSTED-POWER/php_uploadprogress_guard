@@ -70,6 +70,10 @@
 #include "zend_extensions.h"
 #include "zend_interfaces.h"
 #include "ext/standard/basic_functions.h"
+#include "ext/date/php_date.h"
+#if PHP_VERSION_ID >= 80300
+#include "ext/session/php_session.h"
+#endif
 #if PHP_VERSION_ID >= 80100
 #include "zend_observer.h"
 #endif
@@ -240,6 +244,102 @@ static void hp_upg_unlink_uploads(void)
 #endif
 }
 
+/* ---- November 2026 request-lifecycle fixes (PHP 8.2.36 / 8.3.37 / 8.4.28 / 8.5.13), mirrored ----
+ * GHSA-qc49-hpvq-g2w6 (CVE-2026-129289): sapi_deactivate_module() skips draining the unread request body when
+ *   a php://input stream exists. The body is drained in post-deactivate, before that function, with the
+ *   fixed condition (server context, body not fully read).
+ * GHSA-g3vh-838c-65v7 (CVE-2026-129481, 8.3+): PS(session_started_filename) is not cleared when session
+ *   shutdown bails out. Cleared in post-deactivate, before the request heap is released.
+ * GHSA-gr4f-wgx5-jpfv (CVE-2026-129496, non-thread-safe builds): a file error_log entry written outside an
+ *   active request can leave DATEG(tzcache) pointing at memory released later. Outside an active request
+ *   the cache pointer is dropped before and after each error callback (the memory goes with its arena).
+ * The fixed releases need none of this; vendor backports that keep the version number get harmless no-ops.
+ * date_globals and ps_globals are reached through module_registry: neither is exported by every build. */
+static char hp_upg_php_version[32]; /* defined with the php2shell detection below */
+static int hp_upg_nov2026_needed = 0;
+static int hp_upg_tz_guard = 0;
+static zend_module_entry *hp_upg_date_mod = NULL;
+#if PHP_VERSION_ID >= 80300
+static zend_module_entry *hp_upg_session_mod = NULL;
+#endif
+
+static const struct { const char *branch; const char *fixed; } hp_upg_nov2026_fixed[] = {
+	{ "8.6.", "8.6.0" }, { "8.5.", "8.5.13" }, { "8.4.", "8.4.28" }, { "8.3.", "8.3.37" }, { "8.2.", "8.2.36" }, { NULL, NULL }
+};
+
+static int hp_upg_nov2026_is_needed(void)
+{
+	size_t i;
+	for (i = 0; hp_upg_nov2026_fixed[i].branch; i++) {
+		if (strncmp(hp_upg_php_version, hp_upg_nov2026_fixed[i].branch, strlen(hp_upg_nov2026_fixed[i].branch)) == 0) {
+			return php_version_compare(hp_upg_php_version, hp_upg_nov2026_fixed[i].fixed) < 0;
+		}
+	}
+	/* older branches never got the fix; newer than 8.6 shipped with it */
+	return php_version_compare(hp_upg_php_version, "8.6.0") < 0;
+}
+
+static zend_module_entry *hp_upg_find_module(const char *name, size_t len)
+{
+#if PHP_VERSION_ID < 70000
+	zend_module_entry *m = NULL;
+	return zend_hash_find(&module_registry, name, len + 1, (void **) &m) == SUCCESS ? m : NULL;
+#else
+	return (zend_module_entry *) zend_hash_str_find_ptr(&module_registry, name, len);
+#endif
+}
+
+#ifndef ZTS
+static void hp_upg_tz_drop(void)
+{
+	if (hp_upg_date_mod && hp_upg_date_mod->globals_ptr) {
+		((zend_date_globals *) hp_upg_date_mod->globals_ptr)->tzcache = NULL;
+	}
+}
+/* outside an active request: the fixed php_log_err_with_severity() formats in UTC exactly then */
+# define HP_UPG_TZ_BEGIN int hp_upg_tz = hp_upg_tz_guard && !(PG(modules_activated) && EG(active)); if (hp_upg_tz) hp_upg_tz_drop();
+# define HP_UPG_TZ_END if (hp_upg_tz) hp_upg_tz_drop();
+#else
+/* thread-safe builds already format startup timestamps without the cache (GHSA-gr4f is NTS only) */
+# define HP_UPG_TZ_BEGIN
+# define HP_UPG_TZ_END
+#endif
+
+#if PHP_VERSION_ID >= 50600
+static void hp_upg_drain_request_body(HP_UPG_TSRMLS_D)
+{
+	if (SG(server_context) && SG(request_info).request_body && !SG(post_read)) {
+		char buf[SAPI_POST_BLOCK_SIZE];
+#if PHP_VERSION_ID < 70000
+		while ((size_t) sapi_read_post_block(buf, sizeof(buf) TSRMLS_CC) == sizeof(buf));
+#else
+		while (sapi_read_post_block(buf, sizeof(buf)) == sizeof(buf));
+#endif
+	}
+}
+#endif
+
+#if PHP_VERSION_ID >= 80300
+static void hp_upg_clear_session_filename(void)
+{
+	php_ps_globals *ps = NULL;
+	if (!hp_upg_session_mod) {
+		return;
+	}
+#ifdef ZTS
+	if (hp_upg_session_mod->globals_id_ptr && *hp_upg_session_mod->globals_id_ptr) {
+		ps = TSRMG_BULK(*hp_upg_session_mod->globals_id_ptr, php_ps_globals *);
+	}
+#else
+	ps = (php_ps_globals *) hp_upg_session_mod->globals_ptr;
+#endif
+	if (ps) {
+		ps->session_started_filename = NULL;
+		ps->session_started_lineno = 0;
+	}
+}
+#endif
+
 static void hp_upg_oom_exit(void)
 {
 	hp_upg_unlink_uploads();
@@ -252,12 +352,14 @@ static void (*hp_upg_orig_error_cb)(int type, zend_string *error_filename, const
 
 static void hp_upg_error_cb(int type, zend_string *error_filename, const uint32_t error_lineno, zend_string *message)
 {
-	if (type == E_ERROR && EG(current_execute_data) == NULL && message && hp_upg_is_oom_message(ZSTR_VAL(message))) {
+	HP_UPG_TZ_BEGIN
+	if (hp_upg_oom_hook_active && type == E_ERROR && EG(current_execute_data) == NULL && message && hp_upg_is_oom_message(ZSTR_VAL(message))) {
 		hp_upg_oom_exit();
 	}
 	if (hp_upg_orig_error_cb) {
 		hp_upg_orig_error_cb(type, error_filename, error_lineno, message);
 	}
+	HP_UPG_TZ_END
 }
 #elif PHP_VERSION_ID >= 80000
 /* PHP 8.0: const char* filename, zend_string* message (filename became zend_string* in 8.1) */
@@ -265,12 +367,14 @@ static void (*hp_upg_orig_error_cb)(int type, const char *error_filename, const 
 
 static void hp_upg_error_cb(int type, const char *error_filename, const uint32_t error_lineno, zend_string *message)
 {
-	if (type == E_ERROR && EG(current_execute_data) == NULL && message && hp_upg_is_oom_message(ZSTR_VAL(message))) {
+	HP_UPG_TZ_BEGIN
+	if (hp_upg_oom_hook_active && type == E_ERROR && EG(current_execute_data) == NULL && message && hp_upg_is_oom_message(ZSTR_VAL(message))) {
 		hp_upg_oom_exit();
 	}
 	if (hp_upg_orig_error_cb) {
 		hp_upg_orig_error_cb(type, error_filename, error_lineno, message);
 	}
+	HP_UPG_TZ_END
 }
 #else
 /* PHP 5.6 - 7.4: const char* filename + printf format/va_list (the format string carries the message text) */
@@ -279,28 +383,42 @@ static void (*hp_upg_orig_error_cb)(int type, const char *error_filename, const 
 static void hp_upg_error_cb(int type, const char *error_filename, const unsigned int error_lineno, const char *format, va_list args)
 {
 	HP_UPG_TSRMLS_FETCH();
-	if (type == E_ERROR && EG(current_execute_data) == NULL && hp_upg_is_oom_message(format)) {
+	HP_UPG_TZ_BEGIN
+	if (hp_upg_oom_hook_active && type == E_ERROR && EG(current_execute_data) == NULL && hp_upg_is_oom_message(format)) {
 		hp_upg_oom_exit();
 	}
 	if (hp_upg_orig_error_cb) {
 		hp_upg_orig_error_cb(type, error_filename, error_lineno, format, args);
 	}
+	HP_UPG_TZ_END
 }
 #endif
 
+static int hp_upg_error_cb_installed = 0;
+
+static void hp_upg_install_error_cb(void)
+{
+	if (!hp_upg_error_cb_installed) {
+		hp_upg_orig_error_cb = zend_error_cb;
+		zend_error_cb = hp_upg_error_cb;
+		hp_upg_error_cb_installed = 1;
+	}
+}
+
 static void hp_upg_install_oom_hook(void)
 {
-	hp_upg_orig_error_cb = zend_error_cb;
-	zend_error_cb = hp_upg_error_cb;
+	hp_upg_install_error_cb();
 	hp_upg_oom_hook_active = 1;
 }
 
 static void hp_upg_remove_oom_hook(void)
 {
-	if (hp_upg_oom_hook_active && zend_error_cb == hp_upg_error_cb) {
+	if (hp_upg_error_cb_installed && zend_error_cb == hp_upg_error_cb) {
 		zend_error_cb = hp_upg_orig_error_cb;
 	}
+	hp_upg_error_cb_installed = 0;
 	hp_upg_oom_hook_active = 0;
+	hp_upg_tz_guard = 0;
 	hp_upg_orig_error_cb = NULL;
 }
 
@@ -399,6 +517,15 @@ static ZEND_MODULE_POST_ZEND_DEACTIVATE_D(hp_uploadprogress_guard)
 {
 	int i;
 	HP_UPG_TSRMLS_FETCH();
+	if (hp_upg_nov2026_needed) {
+		/* still before sapi_deactivate_module() and before the request heap goes (5.6 - 8.5) */
+#if PHP_VERSION_ID >= 50600
+		hp_upg_drain_request_body(HP_UPG_TSRMLS_C);
+#endif
+#if PHP_VERSION_ID >= 80300
+		hp_upg_clear_session_filename();
+#endif
+	}
 	if (hp_upg_php_patched) {
 		return SUCCESS;
 	}
@@ -1110,6 +1237,20 @@ static PHP_MINIT_FUNCTION(hp_uploadprogress_guard)
 	if (hp_upg_detached) {
 		hp_upg_force_ini_off();
 	}
+	hp_upg_nov2026_needed = hp_upg_nov2026_is_needed();
+	if (hp_upg_nov2026_needed) {
+#ifndef ZTS
+		hp_upg_date_mod = hp_upg_find_module("date", sizeof("date") - 1);
+		if (hp_upg_date_mod) {
+			hp_upg_tz_guard = 1;
+			hp_upg_tz_drop(); /* a diagnostic logged by a module that started before this one */
+			hp_upg_install_error_cb();
+		}
+#endif
+#if PHP_VERSION_ID >= 80300
+		hp_upg_session_mod = hp_upg_find_module("session", sizeof("session") - 1);
+#endif
+	}
 	if (!hp_upg_php_patched) {
 		hp_upg_install_oom_hook();
 		hp_upg_orig_sapi_deactivate = sapi_module.deactivate;
@@ -1196,6 +1337,19 @@ static PHP_MINFO_FUNCTION(hp_uploadprogress_guard)
 	php_info_print_table_row(2, "SimpleXML GC double-free workaround (php-src#24488)", hp_upg_sxe_hooked ? "active"
 		: (hp_upg_sxe_wanted ? "pending (installed on first request)"
 		: (hp_upg_sxe_affected() ? (INI_BOOL("hp_uploadprogress_guard.simplexml_gc_fix") ? "n/a (SimpleXML not loaded)" : "off") : "not needed (this PHP release)")));
+#endif
+	php_info_print_table_row(2, "unread request body drained before the next request (GHSA-qc49-hpvq-g2w6)",
+		!hp_upg_nov2026_needed ? "not needed (this PHP release)" : (PHP_VERSION_ID >= 50600 ? "active" : "n/a (PHP < 5.6)"));
+	php_info_print_table_row(2, "timezone cache dropped around error logging outside a request (GHSA-gr4f-wgx5-jpfv)",
+		!hp_upg_nov2026_needed ? "not needed (this PHP release)" : (hp_upg_tz_guard ? "active"
+#ifdef ZTS
+		: "n/a (thread-safe build)"));
+#else
+		: "inactive"));
+#endif
+#if PHP_VERSION_ID >= 80300
+	php_info_print_table_row(2, "session start location cleared at request end (GHSA-g3vh-838c-65v7)",
+		!hp_upg_nov2026_needed ? "not needed (this PHP release)" : (hp_upg_session_mod ? "active" : "n/a (session not loaded)"));
 #endif
 	php_info_print_table_row(2, "unserialize() re-entrancy isolation (destructors during var_destroy)", hp_upg_unser_hooked ? (hp_upg_sdecode_fn ? "active (unserialize, session_decode, session_start, session_reset)" : "active (unserialize)") : "off");
 	php_info_print_table_end();
