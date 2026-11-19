@@ -59,6 +59,8 @@
  *   connections).
  * CVE-2026-129496 (all): the same wrapper clears ext/date's timezone cache pointer at the end of startup and of
  *   every request, before the memory it points into is released.
+ * CVE-2026-126714 (all): the files session handler truncates before every write, as in the fix (see
+ *   hp_upg_files_hook); hp_uploadprogress_guard.session_files_truncate=0 switches it off.
  *
  * Engines carrying the official fix export a symbol the old ones lack: zend_handle_delayed_oom() (8.2+,
  * delayed out-of-memory handled at a safe point) or zend_mm_safe_error_ex() (the 7.4/8.0/8.1 "minimal
@@ -90,9 +92,7 @@
 #if PHP_VERSION_ID >= 80100
 #include "zend_observer.h"
 #endif
-#if PHP_VERSION_ID >= 80300
 #include "ext/session/php_session.h"
-#endif
 #include <string.h>
 #include <stdarg.h>
 #ifdef PHP_WIN32
@@ -127,7 +127,7 @@ extern void hp_upg_sym_delayed_oom(void) __asm__("zend_handle_delayed_oom") __at
 extern void hp_upg_sym_safe_error_ex(void) __asm__("zend_mm_safe_error_ex") __attribute__((weak));
 #endif
 
-#define HP_MPG_VERSION "3.3.0"
+#define HP_MPG_VERSION "3.3.1"
 #define HP_MPG_NAME "hp_uploadprogress_guard"
 
 /* thread-safe (ZTS) builds, PHP 7+: per-thread globals cache (no-op on NTS) */
@@ -144,9 +144,13 @@ ZEND_TSRMLS_CACHE_DEFINE()
 #if PHP_VERSION_ID < 70000
 #define HP_UPG_TSRMLS_D TSRMLS_D
 #define HP_UPG_TSRMLS_C TSRMLS_C
+#define HP_UPG_TSRMLS_DC TSRMLS_DC
+#define HP_UPG_TSRMLS_CC TSRMLS_CC
 #else
 #define HP_UPG_TSRMLS_D void
 #define HP_UPG_TSRMLS_C
+#define HP_UPG_TSRMLS_DC
+#define HP_UPG_TSRMLS_CC
 #endif
 
 SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler);
@@ -335,31 +339,111 @@ static int hp_upg_sapi_wrapped = 0;
 #define HP_UPG_CLEAR_ZV(zv) ZVAL_UNDEF(&(zv))
 #endif
 
+/* An extension's globals through its module entry, not through the symbol, so this module still loads where
+ * that extension is shared or absent. NULL when it is not started. */
+static void *hp_upg_module_globals(const char *name, size_t len HP_UPG_TSRMLS_DC)
+{
+	zend_module_entry *m;
+#if PHP_VERSION_ID < 70000
+	if (zend_hash_find(&module_registry, (char *) name, len + 1, (void **) &m) != SUCCESS) {
+		return NULL;
+	}
+#else
+	m = zend_hash_str_find_ptr(&module_registry, name, len);
+#endif
+	if (!m || !m->module_started) {
+		return NULL;
+	}
+#ifdef ZTS
+	return ts_resource(*m->globals_id_ptr);
+#else
+	return m->globals_ptr;
+#endif
+}
+
+/* CVE-2026-126714: the files save handler truncates a session file before writing only when the new data is
+ * shorter than what it read (ps_files.st_size); an interrupted longer write leaves the new data followed by the
+ * tail of the old, which unserializes as something neither session contained. The fix truncates before every
+ * write. Here the write function of a copy of the files module sets st_size to INT_MAX first, so the handler's
+ * own check always truncates (an int compare on PHP 5, hence INT_MAX). ps_files is private to mod_files.c: its
+ * three layouts (5.4-5.6, 7.0-8.1, 8.2-8.5, the same in every release of each) are mirrored, and a process
+ * only touches it once it has seen the mirrored fd and st_size match a real session file. The copy is put in
+ * PS(mod) at request start and in session_start(); session.c compares PS(mod) only with the user module. */
+#if PHP_VERSION_ID < 70000
+typedef struct { int fd; char *lastkey; char *basedir; size_t basedir_len; size_t dirdepth; size_t st_size; int filemode; } hp_upg_ps_files;
+#elif PHP_VERSION_ID < 80200
+typedef struct { char *lastkey; char *basedir; size_t basedir_len; size_t dirdepth; size_t st_size; int filemode; int fd; } hp_upg_ps_files;
+#else
+typedef struct { zend_string *last_key; zend_string *basedir; size_t dirdepth; size_t st_size; int filemode; int fd; } hp_upg_ps_files;
+#endif
+static const ps_module *hp_upg_files_orig = NULL;
+static ps_module hp_upg_files_mod;
+static int hp_upg_files_verified = 0;
+
+static int hp_upg_files_layout_ok(hp_upg_ps_files *d)
+{
+	if (!hp_upg_files_verified && d->fd >= 0) {
+		off_t cur = lseek(d->fd, 0, SEEK_CUR), end = -1;
+		if (cur != -1) {
+			end = lseek(d->fd, 0, SEEK_END);
+			lseek(d->fd, cur, SEEK_SET);
+		}
+		hp_upg_files_verified = end != -1 && (size_t) end == d->st_size;
+	}
+	return hp_upg_files_verified;
+}
+
+static PS_WRITE_FUNC(hp_upg_files)
+{
+	hp_upg_ps_files *d = (hp_upg_ps_files *) *mod_data;
+	if (d && hp_upg_files_layout_ok(d)) {
+		d->st_size = INT_MAX;
+	}
+#if PHP_VERSION_ID < 70000
+	return hp_upg_files_orig->s_write(mod_data, key, val, vallen TSRMLS_CC);
+#else
+	return hp_upg_files_orig->s_write(mod_data, key, val, maxlifetime);
+#endif
+}
+
+/* MINIT (one thread): the files module is whatever PS(mod) holds under that name, so no symbol of ext/session
+ * is needed */
+static void hp_upg_files_hook(HP_UPG_TSRMLS_D)
+{
+	php_ps_globals *ps = hp_upg_module_globals("session", sizeof("session") - 1 HP_UPG_TSRMLS_CC);
+	if (!ps || !ps->mod || !ps->mod->s_name || strcmp(ps->mod->s_name, "files") != 0) {
+		return;
+	}
+	memcpy(&hp_upg_files_mod, ps->mod, sizeof(ps_module));
+	hp_upg_files_mod.s_write = ps_write_hp_upg_files;
+	hp_upg_files_orig = ps->mod;
+}
+
+static void hp_upg_files_swap(HP_UPG_TSRMLS_D)
+{
+	php_ps_globals *ps;
+	if (!hp_upg_files_orig) {
+		return;
+	}
+	ps = hp_upg_module_globals("session", sizeof("session") - 1 HP_UPG_TSRMLS_CC);
+	if (ps && ps->mod == hp_upg_files_orig) {
+		ps->mod = &hp_upg_files_mod;
+	}
+	if (ps && ps->default_mod == hp_upg_files_orig) {
+		ps->default_mod = &hp_upg_files_mod;
+	}
+}
+
 /* CVE-2026-129496: an error logged to a file while no request is active caches the timezone in memory that is
  * released right after (end of startup, end of a request after ext/date dropped its cache); the next request's
  * first diagnostic used the stale cache. The SAPI's deactivate callback runs at both points, just before that
- * memory goes: the pointer is cleared there (without freeing, the memory is released next). Globals from the
- * module entry, as for ext/session. */
+ * memory goes: the pointer is cleared there (without freeing, the memory is released next). */
 static void hp_upg_date_clear_tzcache(HP_UPG_TSRMLS_D)
 {
-	zend_date_globals *g;
-#if PHP_VERSION_ID < 70000
-	zend_module_entry *m = NULL;
-	if (zend_hash_find(&module_registry, "date", sizeof("date"), (void **) &m) != SUCCESS) {
-		m = NULL;
+	zend_date_globals *g = hp_upg_module_globals("date", sizeof("date") - 1 HP_UPG_TSRMLS_CC);
+	if (g) {
+		g->tzcache = NULL;
 	}
-#else
-	zend_module_entry *m = zend_hash_str_find_ptr(&module_registry, "date", sizeof("date") - 1);
-#endif
-	if (!m || !m->module_started) {
-		return;
-	}
-#ifdef ZTS
-	g = ts_resource(*m->globals_id_ptr);
-#else
-	g = m->globals_ptr;
-#endif
-	g->tzcache = NULL;
 }
 
 /* sapi_deactivate_module() frees the request_info strings and then calls the SAPI's deactivate callback
@@ -457,28 +541,21 @@ static PHP_RINIT_FUNCTION(hp_uploadprogress_guard)
 		hp_upg_sxe_hook();
 	}
 #endif
+	hp_upg_files_swap(HP_UPG_TSRMLS_C);
 	return SUCCESS;
 }
 
 #if PHP_VERSION_ID >= 80300
 /* CVE-2026-129481: ext/session releases its recorded start location in its own request shutdown; a bailout
  * there skips that and the pointer outlives the request heap. Cleared without releasing, like the others
- * below: the heap goes away right after this. The globals come from the module entry, not the symbol, so
- * this module still loads where ext/session is shared or absent. */
+ * below: the heap goes away right after this. */
 static void hp_upg_session_clear_started(void)
 {
-	zend_module_entry *m = zend_hash_str_find_ptr(&module_registry, "session", sizeof("session") - 1);
-	php_ps_globals *g;
-	if (!m || !m->module_started) {
-		return;
+	php_ps_globals *g = hp_upg_module_globals("session", sizeof("session") - 1 HP_UPG_TSRMLS_CC);
+	if (g) {
+		g->session_started_filename = NULL;
+		g->session_started_lineno = 0;
 	}
-#ifdef ZTS
-	g = ts_resource(*m->globals_id_ptr);
-#else
-	g = m->globals_ptr;
-#endif
-	g->session_started_filename = NULL;
-	g->session_started_lineno = 0;
 }
 #endif
 
@@ -876,6 +953,7 @@ static ZEND_NAMED_FUNCTION(hp_upg_session_decode)
 
 static ZEND_NAMED_FUNCTION(hp_upg_session_start)
 {
+	hp_upg_files_swap(HP_UPG_TSRMLS_C);
 	if (HP_UPG_NEEDS_ISOLATION()) {
 		hp_upg_run_isolated(hp_upg_orig_sstart, INTERNAL_FUNCTION_PARAM_PASSTHRU);
 		return;
@@ -1116,6 +1194,7 @@ PHP_INI_BEGIN()
 	PHP_INI_ENTRY("hp_uploadprogress_guard.unserialize_isolation", "1", PHP_INI_SYSTEM, NULL)
 	PHP_INI_ENTRY("hp_uploadprogress_guard.simplexml_gc_fix", "1", PHP_INI_SYSTEM, NULL)
 	PHP_INI_ENTRY("hp_uploadprogress_guard.disable_fatal_backtraces", "1", PHP_INI_SYSTEM, NULL)
+	PHP_INI_ENTRY("hp_uploadprogress_guard.session_files_truncate", "1", PHP_INI_SYSTEM, NULL)
 PHP_INI_END()
 
 static int hp_upg_client_allowed(void)
@@ -1233,6 +1312,9 @@ static PHP_MINIT_FUNCTION(hp_uploadprogress_guard)
 	if (INI_BOOL("hp_uploadprogress_guard.unserialize_isolation")) {
 		hp_upg_hook_unserialize(HP_UPG_TSRMLS_C);
 	}
+	if (INI_BOOL("hp_uploadprogress_guard.session_files_truncate")) {
+		hp_upg_files_hook(HP_UPG_TSRMLS_C);
+	}
 #if PHP_VERSION_ID >= 80200
 	if (INI_BOOL("hp_uploadprogress_guard.simplexml_gc_fix") && hp_upg_sxe_affected()) {
 		hp_upg_sxe_wanted = 1;
@@ -1308,6 +1390,9 @@ static PHP_MINFO_FUNCTION(hp_uploadprogress_guard)
 		: (hp_upg_sxe_wanted ? "pending (installed on first request)"
 		: (hp_upg_sxe_affected() ? (INI_BOOL("hp_uploadprogress_guard.simplexml_gc_fix") ? "n/a (SimpleXML not loaded)" : "off") : "not needed (this PHP release)")));
 #endif
+	php_info_print_table_row(2, "session file truncated before every write (CVE-2026-126714)", hp_upg_files_orig
+		? (hp_upg_files_verified ? "active" : "active (layout checked at this worker's first session write)")
+		: (INI_BOOL("hp_uploadprogress_guard.session_files_truncate") ? "n/a (default save handler is not files)" : "off"));
 	php_info_print_table_row(2, "unread request body drained before the SAPI finishes (CVE-2026-129289)", PHP_VERSION_ID >= 50600 && hp_upg_sapi_wrapped ? "active" : "n/a");
 	php_info_print_table_row(2, "timezone cache cleared before startup and request memory is released (CVE-2026-129496)", hp_upg_sapi_wrapped ? "active" : "inactive");
 #if PHP_VERSION_ID >= 80300

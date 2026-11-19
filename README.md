@@ -1,10 +1,10 @@
 # hp_uploadprogress_guard
 
-**v3.3.0, 19 November 2026: five of today's critical PHP advisories closed by the module.** PHP released
-8.5.13, 8.4.28, 8.3.37 and 8.2.36 today, with 17 advisories, seven of them critical. Five of those seven can
-be closed from outside the engine, so v3.3.0 does, on every PHP of the affected branches (including the
-end-of-life ones the module supports), patched for php2shell or not. A sixth, CVE-2026-115560, is covered by
-the module since its first version; the seventh, CVE-2026-126714, is not (see below).
+**v3.3.1, 19 November 2026: all seven critical advisories of today's PHP release covered.** PHP released
+8.5.13, 8.4.28, 8.3.37 and 8.2.36 today, with 17 advisories, seven of them critical. Six of those seven can
+be closed from outside the engine, so v3.3.0 and v3.3.1 do, on every PHP of the affected branches (including
+the end-of-life ones the module supports), patched for php2shell or not. The seventh, CVE-2026-115560, is
+covered by the module since its first version.
 
 * **CVE-2026-129289, FastCGI request smuggling (5.6 to 8.5; critical, no memory corruption needed).** When an
   application opens `php://input` without reading it to the end, PHP skips draining the rest of the request
@@ -19,6 +19,12 @@ the module since its first version; the seventh, CVE-2026-126714, is not (see be
   variables) uses it. [GHSA-gr4f-wgx5-jpfv](https://github.com/php/php-src/security/advisories/GHSA-gr4f-wgx5-jpfv).
   **Closed:** the module clears that pointer at the end of startup and of every request, before the memory it
   points into is released.
+* **CVE-2026-126714, partially overwritten session files (all versions; critical; since v3.3.1).** PHP's
+  default `files` session handler truncated a session file before writing only when the new data was shorter.
+  An interrupted longer write left the new data followed by the tail of the old session, which can unserialize
+  into objects neither session contained.
+  [GHSA-fm2m-fjf5-v3cp](https://github.com/php/php-src/security/advisories/GHSA-fm2m-fjf5-v3cp).
+  **Closed:** the handler now truncates before every write, as in the fix.
 * **CVE-2026-129481, interrupted session shutdown (8.3, 8.4, 8.5; critical).** A fatal error in a callback
   that runs while the session shuts down (a user stream wrapper's `stream_close()`, for example) leaves
   ext/session pointing at a script filename in freed memory, and a later request on the same worker frees it
@@ -40,8 +46,7 @@ the module since its first version; the seventh, CVE-2026-126714, is not (see be
   keeps them.
 
 Not covered, because a module cannot reach the code or the fix needs PHP's own internals; each advisory lists
-its workaround: CVE-2026-126714 (`files` session handler, interrupted writes; critical, needs an application
-gadget chain), CVE-2026-129291 (PHP-FPM master, only with `catch_workers_output = yes`), CVE-2026-128064
+its workaround: CVE-2026-129291 (PHP-FPM master, only with `catch_workers_output = yes`), CVE-2026-128064
 (mixed-case `HTTPS://` / `FTPS://` in the stream wrappers), CVE-2026-127960 (folded HTTP response headers),
 CVE-2026-128090 (PHAR signatures), CVE-2026-129506 and CVE-2026-15353 (SOAP), CVE-2026-129501 (DOM),
 CVE-2026-129538 (PHP-CGI `PATH_INFO`), CVE-2026-129292 (PHP-FPM status page) and CVE-2026-129438 (8.5 URI
@@ -251,6 +256,29 @@ module closes their published attack routes (with the one difference noted under
   hp_uploadprogress_guard` shows `SimpleXML GC double-free workaround (php-src#24488) => active` on the
   affected releases and `not needed (this PHP release)` elsewhere, including 8.4.28 and 8.5.13 (since v3.3.0).
 
+**v3.3.1** (19 November): CVE-2026-126714, the last critical advisory of PHP's 19 November release.
+
+* The `files` session handler decides whether to truncate a session file before writing by comparing the new
+  data with the size it read (`st_size` in its private `ps_files` struct). The module gives the handler a copy
+  of the `files` module whose write function sets that size to `INT_MAX` first, so PHP's own check truncates
+  before every write: the official fix, done by PHP's own code. The copy replaces the original in ext/session's
+  current and default handler at request start and in `session_start()`; `SessionHandler` subclasses use it
+  too. Redis, Memcached and user handlers are untouched.
+* `ps_files` is private to PHP. Its three layouts (5.4 to 5.6, 7.0 to 8.1, 8.2 to 8.5) are the same in every
+  release of each group, checked on the first and last release of every branch. A worker only touches it after
+  it has seen the mirrored file descriptor and size match a real session file; until then, and on any build
+  where they do not match, PHP behaves as before.
+* phpinfo: `session file truncated before every write (CVE-2026-126714) => active` (or `active (layout checked
+  at this worker's first session write)` before that). Switch: `hp_uploadprogress_guard.session_files_truncate
+  = 1` (default; `PHP_INI_SYSTEM`).
+
+Tested on 8.5, 8.4, 8.1, 7.4, 7.0 and 5.6: a 200 KB session overwritten with 300 KB under a 100 KB file-size
+limit (the write stops part way, as when a worker is killed) left 102,388 bytes of new data followed by
+97,612 bytes of the old session without the module, and only the new data with it (also through a
+`SessionHandler` subclass). Shrinking and growing sessions, `session_regenerate_id()`, `read_and_close`, lazy
+write and `SessionHandler` subclasses give identical results with and without the module; 40 parallel PHP-FPM
+requests on one session keep an exact counter.
+
 **v3.3.0** (19 November): five advisories of PHP's 19 November security release, see the top of this page.
 
 * **CVE-2026-129289** (5.6 and later): the wrapper around the SAPI's deactivate callback, so far installed only
@@ -449,7 +477,8 @@ Three things happen at process start. None of them is visible to an application:
    `var_destroy()` has already freed. See the v3.2.0 note above.
 6. **SimpleXML does not crash the garbage collector on 8.4.27 and 8.5.12** (since v3.2.1). See the v3.2.1
    note above.
-7. **Request state from the 19 November advisories is cleared at request end** (since v3.3.0): the unread
+7. **Session files are truncated before every write** (since v3.3.1), as in PHP's fix for CVE-2026-126714.
+8. **Request state from the 19 November advisories is cleared at request end** (since v3.3.0): the unread
    request body is drained (5.6+), ext/date's timezone cache pointer is cleared (also at the end of startup),
    and so are ext/session's recorded start location (8.3+) and the saved fatal-error backtrace (8.5); on 8.5
    before 8.5.13 `fatal_error_backtraces` is forced to `0` and locked. See the v3.3.0 note above.
