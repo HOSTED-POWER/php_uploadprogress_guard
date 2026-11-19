@@ -382,8 +382,9 @@ static void (*hp_upg_orig_error_cb)(int type, const char *error_filename, const 
 
 static void hp_upg_error_cb(int type, const char *error_filename, const unsigned int error_lineno, const char *format, va_list args)
 {
-	HP_UPG_TSRMLS_FETCH();
+	/* first: on NTS the fetch below is an empty statement, and C89 compilers (VC9/VC11) want declarations first */
 	HP_UPG_TZ_BEGIN
+	HP_UPG_TSRMLS_FETCH();
 	if (hp_upg_oom_hook_active && type == E_ERROR && EG(current_execute_data) == NULL && hp_upg_is_oom_message(format)) {
 		hp_upg_oom_exit();
 	}
