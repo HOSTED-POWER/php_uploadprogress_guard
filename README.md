@@ -1,5 +1,39 @@
 # hp_uploadprogress_guard
 
+**v3.3.0, 19 November 2026: three of today's critical PHP advisories closed by the module.** PHP released
+8.5.13, 8.4.28, 8.3.37 and 8.2.36 today. Three of the advisories published with them are use-after-free bugs
+the module can close from outside the engine, so v3.3.0 does, on every PHP of the affected branches, patched
+for php2shell or not:
+
+* **CVE-2026-129481, interrupted session shutdown (8.3, 8.4, 8.5; critical).** A fatal error in a callback
+  that runs while the session shuts down (a user stream wrapper's `stream_close()`, for example) leaves
+  ext/session pointing at a script filename in freed memory, and a later request on the same worker frees it
+  again. [GHSA-g3vh-838c-65v7](https://github.com/php/php-src/security/advisories/GHSA-g3vh-838c-65v7).
+  **Closed:** the module clears that pointer at the end of every request, as the fixed release does at the next
+  session start.
+* **CVE-2026-129182, fatal-error backtrace after shutdown (8.5; critical).** A fatal error while PHP restores
+  INI settings after the request (a failed `max_memory_limit` restore, a `zlib.output_compression` /
+  `output_handler` conflict) saves a backtrace that outlives the request's memory; an early warning in the next
+  request reads it. [GHSA-2fjv-p558-g82m](https://github.com/php/php-src/security/advisories/GHSA-2fjv-p558-g82m).
+  **Closed:** the module clears the saved backtrace at the end of every request.
+* **CVE-2026-129474, `__call()` / `__callStatic()` backtraces (8.5 before 8.5.13; critical, remote code
+  execution demonstrated).** A fatal error (memory limit, time limit) while PHP enters a magic method can read
+  freed arguments into the fatal-error backtrace. Laravel facades and Magento proxies reach such calls.
+  [GHSA-8mjj-2r7p-4hg2](https://github.com/php/php-src/security/advisories/GHSA-8mjj-2r7p-4hg2). The bug is in
+  the engine itself; **the module applies the advisory's own workaround**: `fatal_error_backtraces` forced to
+  `0` and locked, so `.user.ini`, `.htaccess` and `ini_set()` cannot turn it back on. Fatal errors are still
+  reported, without the stack trace 8.5 added to them. `hp_uploadprogress_guard.disable_fatal_backtraces = 0`
+  keeps them.
+
+The other four advisories of the release sit where a module cannot reach: the PHP-FPM master process
+(CVE-2026-129291, only with `catch_workers_output = yes`), the HTTP and FTP stream wrappers (CVE-2026-128064,
+mixed-case `HTTPS://`; CVE-2026-127960, folded response headers) and the 8.5 URI extension (CVE-2026-129438).
+Each advisory lists its workaround.
+
+Today's releases also fix two of the three issues below: the SimpleXML crash (the module's workaround now
+applies to 8.4.27 and 8.5.12 only) and CVE-2026-115560 (session upload progress is now off by default). The
+`unserialize()` use-after-free is still not in a release; the module keeps covering it.
+
 **v3.2.7, 12 November 2026: three issues PHP has not fixed in a release yet, covered.** Since the php2shell
 releases, three more problems have surfaced in current PHP. PHP has since fixed two of them in its source code,
 but as of 12 November no PHP release contains any of the fixes: the latest are still 8.5.12, 8.4.27, 8.3.36 and
@@ -198,7 +232,33 @@ module closes their published attack routes (with the one difference noted under
   PHP ships the fix the wrapper still releases the table exactly once, so it is harmless.
 * **Switch.** `hp_uploadprogress_guard.simplexml_gc_fix = 1` (default; `PHP_INI_SYSTEM`). `php --ri
   hp_uploadprogress_guard` shows `SimpleXML GC double-free workaround (php-src#24488) => active` on the
-  affected releases and `not needed (this PHP release)` elsewhere.
+  affected releases and `not needed (this PHP release)` elsewhere, including 8.4.28 and 8.5.13 (since v3.3.0).
+
+**v3.3.0** (19 November): three advisories of PHP's 19 November security release, see the top of this page.
+
+* **CVE-2026-129481** (8.3 and later): the post-deactivate function, which runs after every extension's request
+  shutdown and before the request's memory is released, clears ext/session's recorded start location
+  (`session_started_filename`, `session_started_lineno`). The globals are found through ext/session's module
+  entry, so the module still loads where ext/session is shared or missing. phpinfo: `session start location
+  cleared at request end (CVE-2026-129481) => active`.
+* **CVE-2026-129182** (8.5): the same function now clears the saved fatal-error backtrace on every 8.5, not only
+  on engines without the php2shell fix (8.5.12 clears it before the INI restore that can save it again).
+  phpinfo: `fatal-error backtrace cleared at request end (CVE-2026-129182) => active`.
+* **CVE-2026-129474** (8.5.0 to 8.5.12): `fatal_error_backtraces` forced to `0` and locked at `PHP_INI_SYSTEM`,
+  the same way as `session.upload_progress.enabled`. phpinfo: `fatal_error_backtraces forced to 0 and locked
+  (CVE-2026-129474) => yes`; `not needed (this PHP release)` from 8.5.13. Switch:
+  `hp_uploadprogress_guard.disable_fatal_backtraces = 1` (default; `PHP_INI_SYSTEM`).
+* The SimpleXML workaround (v3.2.1) now applies to 8.4.27 and 8.5.12 only: 8.4.28 and 8.5.13 carry the fix.
+
+Tested with PHP's own reproducers for these advisories, in the official PHP-FPM images, reading the worker's
+memory after the triggering request. 8.5.12 and 8.4.26: after an interrupted session shutdown the worker kept a
+dangling `session_started_filename` without the module, and holds `NULL` with it. 8.5.12: after the
+`max_memory_limit` restore failure the saved backtrace survived the request without the module, and is cleared
+with it. 8.5.12 CLI, `__callStatic()` with an out-of-memory error: the backtrace showed wrong arguments read
+from stale slots without the module; with it `fatal_error_backtraces` reads `0`, `ini_set()` cannot change it
+and no backtrace is built. PHP's serialize, session, SPL and fiber suites give the same results as with 3.2.7 on
+8.3 and 8.5; on 8.5 the three `fatal_error_backtraces` tests now fail, as intended (they turn the setting on).
+ZTS 8.4 builds with `-Wall -Werror`.
 
 **v3.2.7** (12 November): three fixes from a review by Vincent Schmalbach, thank you.
 
@@ -357,6 +417,9 @@ Three things happen at process start. None of them is visible to an application:
    `var_destroy()` has already freed. See the v3.2.0 note above.
 6. **SimpleXML does not crash the garbage collector on 8.4.27 and 8.5.12** (since v3.2.1). See the v3.2.1
    note above.
+7. **Request state from the 19 November advisories is cleared at request end** (since v3.3.0): ext/session's
+   recorded start location (8.3+) and the saved fatal-error backtrace (8.5); on 8.5 before 8.5.13
+   `fatal_error_backtraces` is forced to `0` and locked. See the v3.3.0 note above.
 
 Since v3.0.2 the module also writes the master value of `session.upload_progress.enabled` to `0` and locks
 the entry at `PHP_INI_SYSTEM`: `ini_get()` returns `"0"`, `phpinfo()` shows `Off => Off`, and `.user.ini`,

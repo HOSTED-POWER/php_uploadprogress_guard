@@ -44,6 +44,17 @@
  * deferring publication; the window cannot run out of memory_limit here instead) and restored afterwards.
  * On 8.5 the saved fatal-error backtrace is cleared at request end as well.
  *
+ * 19 November 2026 advisories, applied on every engine of the affected branches, patched or not:
+ * CVE-2026-129182 (8.5): a fatal error while PHP restores INI settings after the executor shut down saves a
+ *   new backtrace that outlives the request heap; the post-deactivate function clears it on every engine.
+ * CVE-2026-129481 (8.3+): a bailout inside session shutdown leaves ext/session's recorded start location
+ *   pointing into the freed request heap; the post-deactivate function clears it, as 8.5.13 does at the
+ *   next session init.
+ * CVE-2026-129474 (8.5 before 8.5.13): a fatal error while PHP enters __call()/__callStatic() can read freed
+ *   arguments into the fatal-error backtrace. The fix is inside the engine; this module applies the
+ *   advisory's workaround instead: fatal_error_backtraces forced to 0 and locked (PHP_INI_SYSTEM), unless
+ *   hp_uploadprogress_guard.disable_fatal_backtraces=0.
+ *
  * Engines carrying the official fix export a symbol the old ones lack: zend_handle_delayed_oom() (8.2+,
  * delayed out-of-memory handled at a safe point) or zend_mm_safe_error_ex() (the 7.4/8.0/8.1 "minimal
  * mitigation", where the allocator _exit()s on every memory exhaustion instead of bailing out). When either
@@ -72,6 +83,9 @@
 #include "ext/standard/basic_functions.h"
 #if PHP_VERSION_ID >= 80100
 #include "zend_observer.h"
+#endif
+#if PHP_VERSION_ID >= 80300
+#include "ext/session/php_session.h"
 #endif
 #include <string.h>
 #include <stdarg.h>
@@ -107,7 +121,7 @@ extern void hp_upg_sym_delayed_oom(void) __asm__("zend_handle_delayed_oom") __at
 extern void hp_upg_sym_safe_error_ex(void) __asm__("zend_mm_safe_error_ex") __attribute__((weak));
 #endif
 
-#define HP_MPG_VERSION "3.2.7"
+#define HP_MPG_VERSION "3.3.0"
 #define HP_MPG_NAME "hp_uploadprogress_guard"
 
 /* thread-safe (ZTS) builds, PHP 7+: per-thread globals cache (no-op on NTS) */
@@ -393,12 +407,42 @@ static PHP_RINIT_FUNCTION(hp_uploadprogress_guard)
 	return SUCCESS;
 }
 
+#if PHP_VERSION_ID >= 80300
+/* CVE-2026-129481: ext/session releases its recorded start location in its own request shutdown; a bailout
+ * there skips that and the pointer outlives the request heap. Cleared without releasing, like the others
+ * below: the heap goes away right after this. The globals come from the module entry, not the symbol, so
+ * this module still loads where ext/session is shared or absent. */
+static void hp_upg_session_clear_started(void)
+{
+	zend_module_entry *m = zend_hash_str_find_ptr(&module_registry, "session", sizeof("session") - 1);
+	php_ps_globals *g;
+	if (!m || !m->module_started) {
+		return;
+	}
+#ifdef ZTS
+	g = ts_resource(*m->globals_id_ptr);
+#else
+	g = m->globals_ptr;
+#endif
+	g->session_started_filename = NULL;
+	g->session_started_lineno = 0;
+}
+#endif
+
 /* Runs after zend_deactivate() destroyed the executor: everything below is already freed, only the stale
  * pointers are replaced by what init_executor() will set anyway, exactly as the fix does in shutdown. */
 static ZEND_MODULE_POST_ZEND_DEACTIVATE_D(hp_uploadprogress_guard)
 {
 	int i;
 	HP_UPG_TSRMLS_FETCH();
+#if PHP_VERSION_ID >= 80500
+	/* CVE-2026-129182: also on engines with the php2shell fix, which clear it before the INI restore that
+	 * can save it again */
+	HP_UPG_CLEAR_ZV(EG(last_fatal_error_backtrace));
+#endif
+#if PHP_VERSION_ID >= 80300
+	hp_upg_session_clear_started();
+#endif
 	if (hp_upg_php_patched) {
 		return SUCCESS;
 	}
@@ -407,9 +451,6 @@ static ZEND_MODULE_POST_ZEND_DEACTIVATE_D(hp_uploadprogress_guard)
 	EG(record_errors) = 0;
 	EG(num_errors) = 0;
 	EG(errors) = NULL;
-#endif
-#if PHP_VERSION_ID >= 80500
-	HP_UPG_CLEAR_ZV(EG(last_fatal_error_backtrace));
 #endif
 	HP_UPG_CLEAR_ZV(EG(user_error_handler));
 	HP_UPG_CLEAR_ZV(EG(user_exception_handler));
@@ -473,15 +514,15 @@ static void hp_upg_force_memory_unlimited(void)
 /* Make the switch visible: set the MASTER value of session.upload_progress.enabled to 0 and lock the entry
  * to PHP_INI_SYSTEM, so ini_get()/phpinfo() report it Off and .user.ini / .htaccess / ini_set() cannot turn
  * it back on. The master value is written directly (not via zend_alter_ini_entry, which PHP would restore
- * at the end of the first request). Runs at MINIT after ext/session registered the entry. */
-static void hp_upg_force_ini_off(void)
+ * at the end of the first request). Runs at MINIT after ext/session registered the entry. Also used for
+ * fatal_error_backtraces (CVE-2026-129474). */
+static int hp_upg_force_ini_off(const char *name, size_t name_len)
 {
-	const char name[] = "session.upload_progress.enabled";
 	zend_ini_entry *e;
 	HP_UPG_TSRMLS_FETCH();
 #if PHP_VERSION_ID < 70000
-	if (zend_hash_find(EG(ini_directives), (char *) name, sizeof(name), (void **) &e) != SUCCESS) {
-		return;
+	if (zend_hash_find(EG(ini_directives), (char *) name, name_len + 1, (void **) &e) != SUCCESS) {
+		return 0;
 	}
 	if (e->on_modify) {
 		e->on_modify(e, "0", 1, e->mh_arg1, e->mh_arg2, e->mh_arg3, ZEND_INI_STAGE_STARTUP TSRMLS_CC);
@@ -491,9 +532,9 @@ static void hp_upg_force_ini_off(void)
 	e->value = zend_strndup("0", 1);
 	e->value_length = 1;
 #else
-	e = zend_hash_str_find_ptr(EG(ini_directives), name, sizeof(name) - 1);
+	e = zend_hash_str_find_ptr(EG(ini_directives), name, name_len);
 	if (!e) {
-		return;
+		return 0;
 	}
 	{
 		zend_string *zero = zend_string_init("0", 1, 1);
@@ -511,7 +552,7 @@ static void hp_upg_force_ini_off(void)
 	}
 #endif
 	e->modifiable = PHP_INI_SYSTEM;
-	hp_upg_ini_forced = 1;
+	return 1;
 }
 static int hp_upg_mbstring = 0;
 #if PHP_VERSION_ID < 70000
@@ -993,13 +1034,24 @@ static void hp_upg_sxe_unhook(void)
 /* Releases carrying the GC change of GH-24050 (php-src#24488): 8.4.27 and 8.5.12 onward until fixed. */
 static int hp_upg_sxe_affected(void)
 {
+	/* introduced by 8.4.27 and 8.5.12, fixed in 8.4.28 and 8.5.13 */
 	if (strncmp(hp_upg_php_version, "8.4.", 4) == 0) {
-		return php_version_compare(hp_upg_php_version, "8.4.27") >= 0;
+		return php_version_compare(hp_upg_php_version, "8.4.27") >= 0 && php_version_compare(hp_upg_php_version, "8.4.28") < 0;
 	}
 	if (strncmp(hp_upg_php_version, "8.5.", 4) == 0) {
-		return php_version_compare(hp_upg_php_version, "8.5.12") >= 0;
+		return php_version_compare(hp_upg_php_version, "8.5.12") >= 0 && php_version_compare(hp_upg_php_version, "8.5.13") < 0;
 	}
 	return 0;
+}
+#endif
+
+#if PHP_VERSION_ID >= 80500
+static int hp_upg_backtraces_forced = 0;
+
+/* CVE-2026-129474: fixed in 8.5.13 */
+static int hp_upg_backtrace_affected(void)
+{
+	return strncmp(hp_upg_php_version, "8.5.", 4) == 0 && php_version_compare(hp_upg_php_version, "8.5.13") < 0;
 }
 #endif
 
@@ -1010,6 +1062,7 @@ PHP_INI_BEGIN()
 	PHP_INI_ENTRY("hp_uploadprogress_guard.force_unlimited_memory", "0", PHP_INI_SYSTEM, NULL)
 	PHP_INI_ENTRY("hp_uploadprogress_guard.unserialize_isolation", "1", PHP_INI_SYSTEM, NULL)
 	PHP_INI_ENTRY("hp_uploadprogress_guard.simplexml_gc_fix", "1", PHP_INI_SYSTEM, NULL)
+	PHP_INI_ENTRY("hp_uploadprogress_guard.disable_fatal_backtraces", "1", PHP_INI_SYSTEM, NULL)
 PHP_INI_END()
 
 static int hp_upg_client_allowed(void)
@@ -1108,8 +1161,13 @@ static PHP_MINIT_FUNCTION(hp_uploadprogress_guard)
 		}
 	}
 	if (hp_upg_detached) {
-		hp_upg_force_ini_off();
+		hp_upg_ini_forced = hp_upg_force_ini_off("session.upload_progress.enabled", sizeof("session.upload_progress.enabled") - 1);
 	}
+#if PHP_VERSION_ID >= 80500
+	if (INI_BOOL("hp_uploadprogress_guard.disable_fatal_backtraces") && hp_upg_backtrace_affected()) {
+		hp_upg_backtraces_forced = hp_upg_force_ini_off("fatal_error_backtraces", sizeof("fatal_error_backtraces") - 1);
+	}
+#endif
 	if (!hp_upg_php_patched) {
 		hp_upg_install_oom_hook();
 		hp_upg_orig_sapi_deactivate = sapi_module.deactivate;
@@ -1196,6 +1254,14 @@ static PHP_MINFO_FUNCTION(hp_uploadprogress_guard)
 	php_info_print_table_row(2, "SimpleXML GC double-free workaround (php-src#24488)", hp_upg_sxe_hooked ? "active"
 		: (hp_upg_sxe_wanted ? "pending (installed on first request)"
 		: (hp_upg_sxe_affected() ? (INI_BOOL("hp_uploadprogress_guard.simplexml_gc_fix") ? "n/a (SimpleXML not loaded)" : "off") : "not needed (this PHP release)")));
+#endif
+#if PHP_VERSION_ID >= 80300
+	php_info_print_table_row(2, "session start location cleared at request end (CVE-2026-129481)", HP_UPG_MODULE_LOADED("session") ? "active" : "n/a (session not loaded)");
+#endif
+#if PHP_VERSION_ID >= 80500
+	php_info_print_table_row(2, "fatal-error backtrace cleared at request end (CVE-2026-129182)", "active");
+	php_info_print_table_row(2, "fatal_error_backtraces forced to 0 and locked (CVE-2026-129474)", hp_upg_backtraces_forced ? "yes"
+		: (hp_upg_backtrace_affected() ? "off" : "not needed (this PHP release)"));
 #endif
 	php_info_print_table_row(2, "unserialize() re-entrancy isolation (destructors during var_destroy)", hp_upg_unser_hooked ? (hp_upg_sdecode_fn ? "active (unserialize, session_decode, session_start, session_reset)" : "active (unserialize)") : "off");
 	php_info_print_table_end();
