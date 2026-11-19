@@ -319,6 +319,9 @@ from stale slots without the module; with it `fatal_error_backtraces` reads `0`,
 and no backtrace is built. PHP's serialize, session, SPL and fiber suites give the same results as with 3.2.7 on
 8.3 and 8.5; on 8.5 the three `fatal_error_backtraces` tests now fail, as intended (they turn the setting on).
 ZTS 8.4 builds with `-Wall -Werror`.
+`test/fcgi-keepconn.py`, contributed by Ming Tsay (#30), checks the same fix with two requests on one kept
+connection and `enable_post_data_reading = 0`: request 2 never completes on 8.5.12 and 8.4.26 without the
+module, and does with it (and on 8.5.13).
 
 **v3.2.7** (12 November): three fixes from a review by Vincent Schmalbach, thank you.
 
@@ -1046,6 +1049,7 @@ dist/       prebuilt NTS .so per PHP minor for x86_64 and aarch64 + SHA256SUMS
 dist/windows/  DLL per PHP minor (7.2-8.5), nts/ts, x64 + SHA256SUMS, from the CI workflow
 build.sh    rebuild dist/ from the oldest official php:<X.Y>-cli images, both architectures
 test/       probe.php, run-builtin-server.sh (Docker functional test), fcgi-probe.py (php-fpm direct)
+            fcgi-keepconn.py (CVE-2026-129289 on one kept FastCGI connection, by Ming Tsay)
 ansible/    the task files and ini files we deploy (Debian/Sury, cPanel EA4, DirectAdmin)
 ```
 
