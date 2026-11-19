@@ -1,5 +1,24 @@
 # hp_uploadprogress_guard
 
+> **Who needs this right now?**
+>
+> * **Everyone still on PHP 8.1, 8.0, 7.x or 5.x.** These versions are end-of-life and get none of PHP's
+>   19 November fixes. This module closes all seven critical advisories of that release on them, without
+>   rebuilding PHP.
+> * **Everyone on PHP 8.2 to 8.5 who cannot upgrade today:** shared hosting, control panels, frozen production
+>   servers.
+> * **Everyone who already upgraded:** keep it installed. It also covers the `unserialize()` use-after-free
+>   (php-src#24481), which PHP has fixed in its source but not shipped in a release yet.
+>
+> **Despite the name, this is no longer only an upload-progress fix.** It started in October as the
+> php2shell mitigation and now closes **nine CVEs and two memory-safety bugs**: php2shell (CVE-2026-109618,
+> CVE-2026-109619), CVE-2026-115560, CVE-2026-129289, CVE-2026-129496, CVE-2026-126714, CVE-2026-129481,
+> CVE-2026-129182 and CVE-2026-129474, plus the SimpleXML double free and the `unserialize()` use-after-free.
+>
+> Prebuilt for **PHP 5.4 to 8.5** on Linux (x86_64, arm64) and Windows (x64, x86), for Sury, Remi, cPanel
+> EA4, DirectAdmin CustomBuild and the official Docker images. Free and open source. Where an official fix
+> is installed, the matching layer steps aside. Upgrading PHP remains the real fix wherever you can.
+
 **v3.3.1, 19 November 2026: all seven critical advisories of today's PHP release covered.** PHP released
 8.5.13, 8.4.28, 8.3.37 and 8.2.36 today, with 17 advisories, seven of them critical. Six of those seven can
 be closed from outside the engine, so v3.3.0 and v3.3.1 do, on every PHP of the affected branches (including
